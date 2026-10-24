@@ -161,16 +161,26 @@ test("capable fallback polls only with demand, recovers transient failure, and i
   assert.equal(forbiddenCalls, 0);
 });
 
-test("resource freshness validates received bounds against actual downstream cache TTLs, not poll frequency", async () => {
-  const provider = { fetch: async () => ({ ok: true }) };
+test("resource freshness uses the actual configured upstream cache TTL, including without a declaration", async () => {
+  let clock = 0; let fetches = 0;
+  const provider = { fetch: async () => { fetches += 1; return { local: true }; } };
   const envelope = { contractVersion: "1.0", kind: "snapshot", subscriptionId: "resource", streamEpoch: 1, sequence: 1, cursor: "freshness", subject: { kind: "resource", key: "opaque" }, data: { ok: true }, meta: { upstreamFreshness: { minimumMs: 4, maximumMs: 6, demandPollIntervalMs: 1 } } };
-  const transport = { subscribe: async ({ onEnvelope }) => { onEnvelope(envelope); return { close() {} }; } };
-  const local = { capabilities: true, providers: { local: provider }, transport, freshness: { pull: [100, 100], upstream: [4, 6], push: [4, 6] } };
-  const rejected = createButchrd({ local });
-  await assert.rejects(rejected.start({ mode: "connected", connectedSubscriptions: [{ id: "resource", subject: { kind: "resource", key: "opaque" }, watchMode: "resource", provider: "local", resource: "desired", downstreamTtlMs: 7 }] }), /strictly greater/);
+  const tooShortFreshness = { pull: [10, 10], upstream: [20, 20], push: [20, 20] };
+  const rejectedEnvelope = { ...envelope, meta: { upstreamFreshness: { minimumMs: 4, maximumMs: 100, demandPollIntervalMs: 1 } } };
+  const rejectingTransport = { subscribe: async ({ onEnvelope }) => { onEnvelope(rejectedEnvelope); return { close() {} }; } };
+  const rejected = createButchrd({ local: { capabilities: true, providers: { local: provider }, transport: rejectingTransport, freshness: tooShortFreshness } });
+  await assert.rejects(rejected.start({ mode: "connected", connectedSubscriptions: [{ id: "resource", subject: { kind: "resource", key: "opaque" }, watchMode: "resource", provider: "local", resource: "desired" }] }), /strictly greater/);
 
-  const accepted = createButchrd({ local });
-  const service = await accepted.start({ mode: "connected", connectedSubscriptions: [{ id: "resource", subject: { kind: "resource", key: "opaque" }, watchMode: "resource", provider: "local", resource: "desired", downstreamTtlMs: 101 }] });
+  const freshness = { pull: [10, 10], upstream: [101, 101], push: [20, 20] };
+  const monitoring = createMorbin({ providers: { local: provider }, now: () => clock, freshness, random: () => 0 });
+  const accepted = createButchrd({ morbin: monitoring, local: { capabilities: true, providers: { local: provider }, transport: { subscribe: async ({ onEnvelope }) => { onEnvelope(rejectedEnvelope); return { close() {} }; } }, freshness } });
+  const service = await accepted.start({ mode: "connected", connectedSubscriptions: [{ id: "resource", subject: { kind: "resource", key: "opaque" }, watchMode: "resource", provider: "local", resource: "desired" }] });
+  clock = 21;
+  assert.deepEqual(await accepted.monitoring.read("local", "desired"), { ok: true });
+  assert.equal(fetches, 0, "the real upstream cache entry has not expired at the old 20ms value");
+  clock = 102;
+  assert.deepEqual(await accepted.monitoring.read("local", "desired"), { local: true });
+  assert.equal(fetches, 1);
   service.stop();
 });
 

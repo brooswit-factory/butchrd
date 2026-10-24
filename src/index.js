@@ -72,9 +72,9 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     handle.close();
   }
 
-  function openSubscription({ id = randomUUID(), subject, watchMode, transport, provider, resource, downstreamTtlMs } = {}) {
+  function openSubscription({ id = randomUUID(), subject, watchMode, transport, provider, resource } = {}) {
     if (!subject || !watchMode) throw new TypeError("subject and watchMode are required");
-    const subscription = { id, subject, watchMode, transport, provider, resource, downstreamTtlMs, epoch: 1, sequence: 0, state: null, closed: false };
+    const subscription = { id, subject, watchMode, transport, provider, resource, epoch: 1, sequence: 0, state: null, closed: false };
     subscriptions.set(id, subscription);
     report("subscription-opened", { id, subject, watchMode, epoch: 1 });
     return { ...subscription };
@@ -258,19 +258,17 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     if (!Number.isFinite(minimumMs) || !Number.isFinite(maximumMs) || minimumMs < 0 || maximumMs < minimumMs) {
       throw new TypeError("received upstreamFreshness must contain finite ordered millisecond bounds");
     }
-    if (subscription.downstreamTtlMs === undefined) return;
-    const ranges = local.freshness;
-    const names = ["pull", "upstream", "push"];
-    if (!ranges || names.some(name => !Array.isArray(ranges[name]) || ranges[name].length !== 2 || !ranges[name].every(Number.isFinite))) {
-      throw new TypeError("downstream TTL validation requires explicit pull, upstream, and push freshness ranges");
+    // `source: upstream` below is the real Morbin cache source for connected
+    // values.  Validate that actual configured range (including when callers
+    // omit any optional declaration), rather than accepting a detached number
+    // that does not control cache expiry.
+    const upstreamRange = local.freshness?.upstream;
+    if (!Array.isArray(upstreamRange) || upstreamRange.length !== 2 || !upstreamRange.every(Number.isFinite)) {
+      throw new TypeError("received upstreamFreshness requires an explicit finite local upstream freshness range");
     }
-    const effectiveMaximum = Math.max(...names.map(name => ranges[name][1]));
-    // This is an actual downstream cache TTL, not the fallback timer.  It
-    // must cover both the received central bound and every local source that
-    // can keep an entry fresh.
     assertFreshnessSeparation({
-      morbrMaximum: Math.max(maximumMs, effectiveMaximum),
-      butchrdMinimum: subscription.downstreamTtlMs,
+      morbrMaximum: maximumMs,
+      butchrdMinimum: upstreamRange[0],
     });
   }
 
