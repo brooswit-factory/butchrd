@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { assertFreshnessSeparation, createMorbin } from "@brooswit-factory/morbin";
+import { assertFreshnessSeparation, canonicalResourceId, createMorbin } from "@brooswit-factory/morbin";
 
 const TERMINAL_CODES = new Set(["UNAUTHORIZED", "FORBIDDEN"]);
 
@@ -29,6 +29,23 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
   // make a provider available to the fallback path.
   const localProviders = local.capabilities ? local.providers ?? {} : {};
   const monitoring = morbin ?? createMorbin({ providers: localProviders, freshness: local.freshness });
+  const blockedConnectedResources = new Set();
+  // Morbin's pinned public API intentionally has no cache mutation primitive.
+  // Keep terminally revoked connected resources unavailable at this consumer
+  // boundary, while leaving independently sourced local cache entries intact.
+  const monitoringView = Object.freeze({
+    read: async (provider, resource, options) => {
+      if (blockedConnectedResources.has(canonicalResourceId(provider, resource))) throw terminalAccessError();
+      return monitoring.read(provider, resource, options);
+    },
+    cacheEntry: (provider, resource) => blockedConnectedResources.has(canonicalResourceId(provider, resource))
+      ? undefined : monitoring.cacheEntry(provider, resource),
+    watchResource: (...args) => monitoring.watchResource(...args),
+    watchQuery: (...args) => monitoring.watchQuery(...args),
+    receive: (...args) => monitoring.receive(...args),
+    reconnect: (...args) => monitoring.reconnect(...args),
+    poll: (...args) => monitoring.poll(...args),
+  });
 
   function report(kind, data = {}) {
     const event = { kind, data, deploymentId, instanceId };
@@ -74,7 +91,10 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     if (TERMINAL_CODES.has(terminalCode)) {
       revoked = true;
       shutdown();
-      for (const subscription of subscriptions.values()) closeHandle(subscription.transport);
+      for (const subscription of subscriptions.values()) {
+        if (subscription.provider) blockedConnectedResources.add(canonicalResourceId(subscription.provider, subscription.resource));
+        closeHandle(subscription.transport);
+      }
       subscriptions.clear();
       connectedConfig = null;
       connectedConfigVersion = -1;
@@ -157,8 +177,15 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     lifecycleStopped = false;
     const locallyCapable = local.capabilities === true && Object.keys(localProviders).length > 0;
     if (locallyCapable && local.pollIntervalMs !== undefined) {
+      const upstreamRange = local.freshness?.upstream;
+      if (!Array.isArray(upstreamRange) || upstreamRange.length !== 2 || !upstreamRange.every(Number.isFinite)) {
+        throw new TypeError("local fallback polling requires an explicit finite upstream freshness range");
+      }
+      if (local.morbrMaximumTtlMs !== upstreamRange[1]) {
+        throw new RangeError("advertised Morbr maximum TTL must equal the configured upstream freshness maximum");
+      }
       assertFreshnessSeparation({
-        morbrMaximum: local.morbrMaximumTtlMs ?? local.freshness?.upstream?.[1],
+        morbrMaximum: upstreamRange[1],
         butchrdMinimum: local.pollIntervalMs,
       });
     }
@@ -213,7 +240,7 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     }
     // Morbin only fetches stale entries with an active watch.  This timer is
     // lifecycle-owned and exists solely for locally capable fallback watches.
-    if (locallyCapable && watches.length && local.pollIntervalMs !== undefined) {
+    if (!lifecycleStopped && locallyCapable && watches.length && local.pollIntervalMs !== undefined) {
       const timer = setInterval(() => {
         void monitoring.poll().catch(error => report("monitoring-poll-failed", { message: error.message }));
       }, local.pollIntervalMs);
@@ -258,10 +285,16 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
 
   return {
     daemon: "butchrd", deploymentId, instanceId, openSubscription, replaceSubscription,
-    receive, reconnect, effectiveConfig, runWork, start, reconcile, monitoring, reportActivity: report,
+    receive, reconnect, effectiveConfig, runWork, start, reconcile, monitoring: monitoringView, reportActivity: report,
     get activity() { return [...activity]; },
     get connected() { return !revoked && connectedConfig !== null; },
   };
+}
+
+function terminalAccessError() {
+  const error = new Error("FORBIDDEN");
+  error.code = "FORBIDDEN";
+  return error;
 }
 
 function memoryStore() {

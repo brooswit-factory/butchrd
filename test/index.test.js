@@ -161,6 +161,43 @@ test("capable fallback polls only with demand, recovers transient failure, and i
   assert.equal(forbiddenCalls, 0);
 });
 
+test("fallback timing validates the actual upstream cache range and advertised maximum", async () => {
+  const provider = { fetch: async () => ({ ok: true }) };
+  const daemon = createButchrd({ local: {
+    capabilities: true, providers: { local: provider }, freshness: { upstream: [5, 7] },
+    morbrMaximumTtlMs: 6, pollIntervalMs: 8,
+  } });
+  await assert.rejects(daemon.start({ watches: [{ provider: "local", resource: "desired" }] }), /advertised Morbr maximum TTL/);
+  await assert.rejects(createButchrd({ local: {
+    capabilities: true, providers: { local: provider }, freshness: { upstream: [5, 7] },
+    morbrMaximumTtlMs: 7, pollIntervalMs: 7,
+  } }).start({ watches: [{ provider: "local", resource: "desired" }] }), /strictly greater/);
+});
+
+test("terminal revocation hides only connected-origin cache entries and cannot start a late fallback timer", async () => {
+  let calls = 0;
+  const provider = { fetch: async () => { calls += 1; return { local: true }; } };
+  const monitoring = createMorbin({ providers: { local: provider }, freshness: { upstream: [5, 5], pull: [1, 1] } });
+  await monitoring.receive({ provider: "local", resource: "unrelated", value: { local: "kept" } });
+  const transport = { subscribe: async ({ onEnvelope }) => {
+    onEnvelope({ contractVersion: "1.0", kind: "snapshot", subscriptionId: "protected", streamEpoch: 1, sequence: 1, cursor: "upstream", subject: { kind: "resource", key: "opaque" }, data: { protected: true } });
+    onEnvelope({ contractVersion: "1.0", kind: "error", error: { code: "FORBIDDEN" } });
+    return { close() {} };
+  } };
+  const daemon = createButchrd({ morbin: monitoring, local: {
+    capabilities: true, providers: { local: provider }, transport,
+    freshness: { upstream: [5, 5], pull: [1, 1] }, morbrMaximumTtlMs: 5, pollIntervalMs: 6,
+  } });
+  await daemon.start({ mode: "connected", watches: [{ provider: "local", resource: "fallback" }], connectedSubscriptions: [
+    { id: "protected", subject: { kind: "resource", key: "opaque" }, watchMode: "resource", provider: "local", resource: "protected" },
+  ] });
+  assert.equal(daemon.monitoring.cacheEntry("local", "protected"), undefined);
+  await assert.rejects(daemon.monitoring.read("local", "protected"), /FORBIDDEN/);
+  assert.deepEqual(daemon.monitoring.cacheEntry("local", "unrelated").value, { local: "kept" });
+  await delay(20);
+  assert.equal(calls, 0, "synchronous revocation leaves no fallback watch or interval alive");
+});
+
 test("terminal authorization during synchronous connected subscribe closes the late handle", async () => {
   let closed = 0;
   const transport = { subscribe: ({ onEnvelope }) => {
