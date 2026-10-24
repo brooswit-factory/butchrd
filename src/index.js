@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { createMorbin } from "@brooswit-factory/morbin";
+import { assertFreshnessSeparation, createMorbin } from "@brooswit-factory/morbin";
 
 const TERMINAL_CODES = new Set(["UNAUTHORIZED", "FORBIDDEN"]);
 
@@ -24,8 +24,11 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
   let connectedConfig = null;
   let connectedConfigVersion = -1;
   let revoked = false;
-  // The shared library owns provider monitoring/freshness; this daemon never polls a provider itself.
-  const monitoring = morbin ?? createMorbin({ providers: local.providers ?? {} });
+  // The shared library owns provider monitoring/freshness.  Providers are an
+  // independently configured local capability: connected credentials never
+  // make a provider available to the fallback path.
+  const localProviders = local.capabilities ? local.providers ?? {} : {};
+  const monitoring = morbin ?? createMorbin({ providers: localProviders, freshness: local.freshness });
 
   function report(kind, data = {}) {
     const event = { kind, data, deploymentId, instanceId };
@@ -106,6 +109,19 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
       if (version <= connectedConfigVersion) return { accepted: false, stale: true };
       if (envelope.kind === "snapshot" || envelope.kind === "change") { connectedConfig = envelope.data; connectedConfigVersion = version; }
     }
+    // A connected resource must name its local provider/resource explicitly.
+    // Subjects are opaque contract identifiers, so never derive local access
+    // from their string form.  Morbin updates the same cache used by a later
+    // local read, allowing a fresh upstream value to postpone fallback fetch.
+    if (subscription.provider && envelope.subject?.kind === "resource" && (envelope.kind === "snapshot" || envelope.kind === "change")) {
+      void monitoring.receive({
+        provider: subscription.provider,
+        resource: subscription.resource,
+        value: envelope.data,
+        cursor: envelope.cursor,
+        source: "upstream",
+      }).catch(error => report("monitoring-receive-failed", { message: error.message }));
+    }
     report("envelope-received", { subscriptionId: envelope.subscriptionId, kind: envelope.kind });
     return { accepted: true };
   }
@@ -139,6 +155,13 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     if (mode === "connected" && !local.transport) throw new Error("connected mode requires a configured transport");
     if (mode === "connected" && typeof local.transport.subscribe !== "function") throw new TypeError("connected transport must implement subscribe");
     lifecycleStopped = false;
+    const locallyCapable = local.capabilities === true && Object.keys(localProviders).length > 0;
+    if (locallyCapable && local.pollIntervalMs !== undefined) {
+      assertFreshnessSeparation({
+        morbrMaximum: local.morbrMaximumTtlMs ?? local.freshness?.upstream?.[1],
+        butchrdMinimum: local.pollIntervalMs,
+      });
+    }
     const applyWatch = event => {
       const result = receive(event);
       if (result.accepted && Array.isArray(event.data?.desired)) {
@@ -148,7 +171,17 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
       return result;
     };
     for (const subscription of connectedSubscriptions) {
+      if (subscription.provider !== undefined || subscription.resource !== undefined) {
+        if (subscription.subject?.kind !== "resource" || !subscription.provider || subscription.resource === undefined) {
+          throw new TypeError("connected resource mappings require subject.kind=resource plus provider and resource");
+        }
+      }
       if (!subscriptions.has(subscription.id)) openSubscription(subscription);
+      const opened = subscriptions.get(subscription.id);
+      if (opened && subscription.provider) {
+        opened.provider = subscription.provider;
+        opened.resource = subscription.resource;
+      }
     }
     if (mode === "connected") {
       const transport = await local.transport.subscribe({ deploymentId, instanceId, onEnvelope: applyWatch });
@@ -161,6 +194,7 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     }
     for (const { provider, resource, query, mode: watchMode = "resource" } of watches) {
       if (lifecycleStopped) break;
+      if (!locallyCapable && !morbin) throw new Error("local monitoring watches require independently configured local capabilities");
       const handle = resource !== undefined
         ? monitoring.watchResource(provider, resource, applyWatch)
         : monitoring.watchQuery(provider, query, watchMode === "query-membership" ? "membership" : "content", applyWatch);
@@ -176,6 +210,14 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
       }
       if (lifecycleStopped) closeHandle(handle);
       else activeHandles.add(handle);
+    }
+    // Morbin only fetches stale entries with an active watch.  This timer is
+    // lifecycle-owned and exists solely for locally capable fallback watches.
+    if (locallyCapable && watches.length && local.pollIntervalMs !== undefined) {
+      const timer = setInterval(() => {
+        void monitoring.poll().catch(error => report("monitoring-poll-failed", { message: error.message }));
+      }, local.pollIntervalMs);
+      activeHandles.add({ close: () => clearInterval(timer) });
     }
     report("daemon-started", { mode });
     let stopped = false;

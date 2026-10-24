@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createButchrd, createFileStore } from "../src/index.js";
+import { createMorbin } from "@brooswit-factory/morbin";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -107,6 +108,57 @@ test("connected mode subscribes, consumes versioned config envelopes, and closes
   assert.equal(daemon.connected, true);
   assert.deepEqual(daemon.effectiveConfig(), { version: 1, value: { pollMs: 1000 } });
   service.stop(); assert.equal(closed, 1);
+});
+
+test("connected resource updates populate the mapped Morbin cache before a local read", async () => {
+  let fetches = 0;
+  const provider = { fetch: async () => { fetches += 1; return { value: "local" }; } };
+  const monitoring = createMorbin({
+    providers: { local: provider }, random: () => 0,
+    freshness: { upstream: [1_000, 1_000], pull: [100, 100] },
+  });
+  const transport = { subscribe: async ({ onEnvelope }) => {
+    onEnvelope({ contractVersion: "1.0", kind: "snapshot", subscriptionId: "resource-sub", streamEpoch: 1, sequence: 1, cursor: "upstream-1", subject: { kind: "resource", key: "opaque-central-subject" }, data: { value: "upstream" } });
+    return { close() {} };
+  } };
+  const daemon = createButchrd({ morbin: monitoring, local: { transport } });
+  const service = await daemon.start({
+    mode: "connected",
+    connectedSubscriptions: [{ id: "resource-sub", subject: { kind: "resource", key: "opaque-central-subject" }, watchMode: "resource", provider: "local", resource: "desired" }],
+  });
+  assert.deepEqual(monitoring.cacheEntry("local", "desired").value, { value: "upstream" });
+  assert.deepEqual(await monitoring.read("local", "desired"), { value: "upstream" });
+  assert.equal(fetches, 0, "a fresh upstream cache entry postpones local fallback fetch");
+  service.stop();
+});
+
+test("capable fallback polls only with demand, recovers transient failure, and incapable mode never calls a provider", async () => {
+  let attempts = 0;
+  const provider = { fetch: async () => {
+    attempts += 1;
+    if (attempts === 1) throw new Error("temporary local failure");
+    return { recovered: true };
+  } };
+  const daemon = createButchrd({
+    local: {
+      capabilities: true,
+      providers: { local: provider },
+      freshness: { upstream: [5, 5], pull: [1, 1] },
+      morbrMaximumTtlMs: 5,
+      pollIntervalMs: 6,
+    },
+  });
+  const service = await daemon.start({ watches: [{ provider: "local", resource: "desired" }] });
+  await eventually(() => assert.ok(attempts >= 2));
+  service.stop();
+  const attemptsAfterStop = attempts;
+  await delay(20);
+  assert.equal(attempts, attemptsAfterStop, "shutdown clears lifecycle-owned polling");
+
+  let forbiddenCalls = 0;
+  const incapable = createButchrd({ local: { providers: { local: { fetch: async () => { forbiddenCalls += 1; } } } } });
+  await assert.rejects(incapable.start({ watches: [{ provider: "local", resource: "desired" }] }), /independently configured local capabilities/);
+  assert.equal(forbiddenCalls, 0);
 });
 
 test("terminal authorization during synchronous connected subscribe closes the late handle", async () => {

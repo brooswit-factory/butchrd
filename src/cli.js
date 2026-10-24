@@ -76,7 +76,13 @@ const workers = config.fakeWorker
   : config.activityFile ? { reportActivity: event => appendFileSync(config.activityFile, `${JSON.stringify(event)}\n`) } : {};
 const providers = config.fakeProvider ? { fake: configuredFakeProvider(config.fakeProvider) } : {};
 const transport = config.fakeTransport ? configuredFakeTransport(config.fakeTransport) : undefined;
-const daemon = createButchrd({ store: createFileStore(statePath), workers, local: { providers, transport } });
+const daemon = createButchrd({
+  store: createFileStore(statePath),
+  workers,
+  // A configured fake provider is an explicit local test capability; it is
+  // never inferred from connected transport configuration.
+  local: { providers, transport, capabilities: Boolean(config.fakeProvider) },
+});
 const service = await daemon.start({
   mode: config.mode ?? "standalone",
   watches: config.watches ?? [],
