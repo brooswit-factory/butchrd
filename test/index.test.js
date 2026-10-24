@@ -83,3 +83,11 @@ test("file store survives process-style restart with a new instance identity", (
   const first = createButchrd({ store: createFileStore(path) }); const second = createButchrd({ store: createFileStore(path) });
   assert.equal(first.deploymentId, second.deploymentId); assert.notEqual(first.instanceId, second.instanceId); rmSync(dir, { recursive: true });
 });
+
+test("a fake Morbin resource watch drives desired worker reconciliation", async () => {
+  let listener; const ran = []; const monitoring = { watchResource: (_p, _r, next) => { listener = next; return { close() {} }; } };
+  const daemon = createButchrd({ morbin: monitoring, workers: { execute: async work => ran.push(work.id) } });
+  await daemon.start({ watches: [{ provider: "fake", resource: "desired" }] });
+  listener({ contractVersion: "1.0", kind: "snapshot", subscriptionId: daemon.openSubscription({ subject: { kind: "resource", key: "desired" }, watchMode: "resource" }).id, streamEpoch: 1, sequence: 1, cursor: "d1", subject: { kind: "resource", key: "desired" }, data: { desired: [{ id: "from-provider" }] } });
+  await new Promise(resolve => setImmediate(resolve)); assert.deepEqual(ran, ["from-provider"]);
+});

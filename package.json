@@ -4,6 +4,9 @@
   "private": false,
   "type": "module",
   "exports": "./src/index.js",
+  "bin": {
+    "butchrd": "./src/cli.js"
+  },
   "dependencies": {
     "@brooswit-factory/morbin": "git+https://github.com/brooswit-factory/morbin.git#39e47eb8089e6ef17426e8607beec21759b30c40"
   },
