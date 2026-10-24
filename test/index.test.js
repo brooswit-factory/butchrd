@@ -93,6 +93,40 @@ test("a fake Morbin resource watch drives desired worker reconciliation", async 
   await new Promise(resolve => setImmediate(resolve)); assert.deepEqual(ran, ["from-provider"]);
 });
 
+test("connected mode subscribes, consumes versioned config envelopes, and closes its transport", async () => {
+  let request; let closed = 0;
+  const transport = { subscribe: async next => { request = next; return { close: () => { closed += 1; } }; } };
+  const daemon = createButchrd({ local: { transport } });
+  const service = await daemon.start({
+    mode: "connected",
+    connectedSubscriptions: [{ id: "config-sub", subject: { kind: "config", key: "daemon" }, watchMode: "resource" }],
+  });
+  assert.equal(request.deploymentId, daemon.deploymentId);
+  assert.equal(request.instanceId, daemon.instanceId);
+  assert.deepEqual(request.onEnvelope({ contractVersion: "1.0", kind: "snapshot", subscriptionId: "config-sub", streamEpoch: 1, sequence: 1, cursor: "config-1", subject: { kind: "config", key: "daemon" }, data: { version: 1, value: { pollMs: 1000 } } }), { accepted: true });
+  assert.equal(daemon.connected, true);
+  assert.deepEqual(daemon.effectiveConfig(), { version: 1, value: { pollMs: 1000 } });
+  service.stop(); assert.equal(closed, 1);
+});
+
+test("reconciliation avoids duplicate in-flight work and does not dispatch queued work after stop", async () => {
+  let release; const calls = [];
+  const gate = new Promise(resolve => { release = resolve; });
+  const daemon = createButchrd({ workers: {
+    execute: async work => { calls.push(`run:${work.id}`); await gate; },
+    stop: async id => calls.push(`stop:${id}`),
+  } });
+  const service = await daemon.start();
+  const first = daemon.reconcile({ desired: [{ id: "a" }, { id: "b" }] });
+  await new Promise(resolve => setImmediate(resolve));
+  const duplicate = daemon.reconcile({ desired: [{ id: "a" }] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, ["run:a"]);
+  service.stop(); release();
+  await Promise.all([first, duplicate]);
+  assert.deepEqual(calls, ["run:a", "stop:a"]);
+});
+
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 async function eventually(assertion, timeout = 2_000) {
   const deadline = Date.now() + timeout;
@@ -121,22 +155,29 @@ function waitForExit(child, timeout = 2_000) {
 test("CLI keeps a configured fake Morbin transport alive and SIGTERM closes it", async t => {
   const dir = mkdtempSync(join(tmpdir(), "butchrd-cli-"));
   const state = join(dir, "state.json"); const eventFile = join(dir, "event.json");
-  const activityFile = join(dir, "activity.jsonl"); const configPath = join(dir, "config.json");
-  writeFileSync(eventFile, JSON.stringify({ resource: "desired", value: { desired: [] }, cursor: "initial" }));
+  const activityFile = join(dir, "activity.jsonl"); const workLog = join(dir, "work.jsonl"); const configPath = join(dir, "config.json");
+  const desired = [{ id: "fake-a" }, { id: "fake-b" }];
+  writeFileSync(eventFile, JSON.stringify({ resource: "desired", value: { desired }, cursor: "initial" }));
   writeFileSync(configPath, JSON.stringify({
-    fakeProvider: { resources: { desired: { desired: [] } }, eventFile },
+    fakeProvider: { resources: { desired: { desired } }, eventFile },
     watches: [{ provider: "fake", resource: "desired" }], activityFile,
+    fakeWorker: { logFile: workLog, delayMs: 300 },
   }));
   const first = startCli(["--state", state, "--config", configPath]);
   t.after(() => { if (first.child.exitCode === null) first.child.kill("SIGKILL"); });
   await eventually(() => assert.match(first.stdout(), /deploymentId/));
   assert.equal(first.child.exitCode, null, "the configured provider transport keeps the CLI alive");
   await eventually(() => assert.match(readFileSync(activityFile, "utf8"), /envelope-received/));
-  writeFileSync(eventFile, JSON.stringify({ resource: "desired", value: { desired: [] }, cursor: "process-change", source: "push" }));
+  await eventually(() => assert.match(readFileSync(workLog, "utf8"), /"execute","id":"fake-a"/));
+  writeFileSync(eventFile, JSON.stringify({ resource: "desired", value: { desired }, cursor: "process-change", source: "push" }));
   await eventually(() => assert.ok((readFileSync(activityFile, "utf8").match(/envelope-received/g) ?? []).length >= 2));
   first.child.kill("SIGTERM");
   assert.deepEqual(await waitForExit(first.child), { code: 0, signal: null });
   assert.equal(first.stderr(), "");
+  const work = readFileSync(workLog, "utf8");
+  assert.equal((work.match(/"execute","id":"fake-a"/g) ?? []).length, 1, "a repeated desired event cannot duplicate pending work");
+  assert.match(work, /"stop","id":"fake-a"/);
+  assert.doesNotMatch(work, /fake-b/, "queued work must not begin after SIGTERM");
   const firstIdentity = JSON.parse(first.stdout().trim());
   const second = startCli(["--state", state, "--config", configPath]);
   t.after(() => { if (second.child.exitCode === null) second.child.kill("SIGKILL"); });
@@ -147,5 +188,31 @@ test("CLI keeps a configured fake Morbin transport alive and SIGTERM closes it",
   assert.equal(firstIdentity.deploymentId, secondIdentity.deploymentId);
   assert.notEqual(firstIdentity.instanceId, secondIdentity.instanceId);
   assert.equal(second.stderr(), "");
+  rmSync(dir, { recursive: true });
+});
+
+test("CLI consumes configured connected config snapshots and changes", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "butchrd-connected-"));
+  const state = join(dir, "state.json"); const eventFile = join(dir, "transport.json");
+  const activityFile = join(dir, "activity.jsonl"); const configPath = join(dir, "config.json");
+  const configEnvelope = (kind, sequence, version) => ({ contractVersion: "1.0", kind, subscriptionId: "config-sub", streamEpoch: 1, sequence, cursor: `config-${version}`, subject: { kind: "config", key: "daemon" }, data: { version, value: { pollMs: version * 1000 } } });
+  const resourceEnvelope = { contractVersion: "1.0", kind: "snapshot", subscriptionId: "resource-sub", streamEpoch: 1, sequence: 1, cursor: "resource-1", subject: { kind: "resource", key: "desired" }, data: { desired: [] } };
+  writeFileSync(eventFile, JSON.stringify({ envelopes: [configEnvelope("snapshot", 1, 1), resourceEnvelope] }));
+  writeFileSync(configPath, JSON.stringify({
+    mode: "connected", fakeTransport: { eventFile }, activityFile,
+    connectedSubscriptions: [
+      { id: "config-sub", subject: { kind: "config", key: "daemon" }, watchMode: "resource" },
+      { id: "resource-sub", subject: { kind: "resource", key: "desired" }, watchMode: "resource" },
+    ],
+  }));
+  const cli = startCli(["--state", state, "--config", configPath]);
+  t.after(() => { if (cli.child.exitCode === null) cli.child.kill("SIGKILL"); });
+  await eventually(() => assert.match(cli.stdout(), /deploymentId/));
+  await eventually(() => assert.equal((readFileSync(activityFile, "utf8").match(/envelope-received/g) ?? []).length, 2));
+  writeFileSync(eventFile, JSON.stringify({ envelopes: [configEnvelope("change", 2, 2)] }));
+  await eventually(() => assert.equal((readFileSync(activityFile, "utf8").match(/envelope-received/g) ?? []).length, 3));
+  cli.child.kill("SIGTERM");
+  assert.deepEqual(await waitForExit(cli.child), { code: 0, signal: null });
+  assert.equal(cli.stderr(), "");
   rmSync(dir, { recursive: true });
 });

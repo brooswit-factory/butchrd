@@ -17,6 +17,8 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
   const seenCursors = new Set();
   const activity = [];
   const activeWork = new Map();
+  let lifecycleStopped = false;
+  let reconciliation = Promise.resolve();
   let connectedConfig = null;
   let connectedConfigVersion = -1;
   let revoked = false;
@@ -115,14 +117,28 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     finally { activeWork.delete(work.id); }
   }
 
-  async function start({ mode = "standalone", watches = [] } = {}) {
+  async function start({ mode = "standalone", watches = [], connectedSubscriptions = [] } = {}) {
     if (mode === "connected" && !local.transport) throw new Error("connected mode requires a configured transport");
+    if (mode === "connected" && typeof local.transport.subscribe !== "function") throw new TypeError("connected transport must implement subscribe");
+    lifecycleStopped = false;
     const applyWatch = event => {
       const result = receive(event);
-      if (result.accepted && Array.isArray(event.data?.desired)) void reconcile({ desired: event.data.desired, running: event.data.running ?? [], resting: event.data.resting ?? [] });
+      if (result.accepted && Array.isArray(event.data?.desired)) {
+        void reconcile({ desired: event.data.desired, running: event.data.running ?? [], resting: event.data.resting ?? [] })
+          .catch(error => report("reconcile-failed", { message: error.message }));
+      }
       return result;
     };
-    const handles = watches.map(({ provider, resource, query, mode: watchMode = "resource" }) => {
+    const handles = [];
+    for (const subscription of connectedSubscriptions) {
+      if (!subscriptions.has(subscription.id)) openSubscription(subscription);
+    }
+    if (mode === "connected") {
+      const transport = await local.transport.subscribe({ deploymentId, instanceId, onEnvelope: applyWatch });
+      if (!transport?.close) throw new TypeError("connected transport subscription must return a closeable handle");
+      handles.push(transport);
+    }
+    for (const { provider, resource, query, mode: watchMode = "resource" } of watches) {
       const handle = resource !== undefined
         ? monitoring.watchResource(provider, resource, applyWatch)
         : monitoring.watchQuery(provider, query, watchMode === "query-membership" ? "membership" : "content", applyWatch);
@@ -136,8 +152,8 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
           transport: handle,
         });
       }
-      return handle;
-    });
+      handles.push(handle);
+    }
     report("daemon-started", { mode });
     let stopped = false;
     return {
@@ -145,6 +161,7 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
       stop: () => {
         if (stopped) return;
         stopped = true;
+        lifecycleStopped = true;
         for (const handle of handles) handle.close();
         for (const id of activeWork.keys()) void workers.stop?.(id);
         report("daemon-stopped", { mode });
@@ -152,13 +169,28 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     };
   }
 
-  async function reconcile({ desired = [], running = [], resting = [] } = {}) {
+  function reconcile(input = {}) {
+    const job = reconciliation.then(() => reconcileNow(input));
+    // Keep the serial queue usable after a worker/reconciliation failure; the
+    // caller still receives the rejected job and watch callers report it.
+    reconciliation = job.catch(() => {});
+    return job;
+  }
+
+  async function reconcileNow({ desired = [], running = [], resting = [] } = {}) {
+    if (lifecycleStopped) return { spawned: [], stopped: [] };
     const want = new Map(desired.filter(work => !work.held).map(work => [work.id, work]));
     const have = new Set(running); const asleep = new Set(resting);
     const spawned = [];
-    for (const [id, work] of want) if (!have.has(id)) { await runWork(work); spawned.push(id); }
+    for (const [id, work] of want) {
+      if (lifecycleStopped) break;
+      if (!have.has(id) && !activeWork.has(id)) { await runWork(work); spawned.push(id); }
+    }
     const stopped = [];
-    for (const id of have) if (!want.has(id) && !asleep.has(id)) { await workers.stop?.(id); stopped.push(id); }
+    for (const id of have) {
+      if (lifecycleStopped) break;
+      if (!want.has(id) && !asleep.has(id)) { await workers.stop?.(id); stopped.push(id); }
+    }
     return { spawned, stopped };
   }
 
