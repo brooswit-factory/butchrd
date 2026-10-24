@@ -161,17 +161,17 @@ test("capable fallback polls only with demand, recovers transient failure, and i
   assert.equal(forbiddenCalls, 0);
 });
 
-test("fallback timing validates the actual upstream cache range and advertised maximum", async () => {
+test("resource freshness validates received bounds against actual downstream cache TTLs, not poll frequency", async () => {
   const provider = { fetch: async () => ({ ok: true }) };
-  const daemon = createButchrd({ local: {
-    capabilities: true, providers: { local: provider }, freshness: { upstream: [5, 7] },
-    morbrMaximumTtlMs: 6, pollIntervalMs: 8,
-  } });
-  await assert.rejects(daemon.start({ watches: [{ provider: "local", resource: "desired" }] }), /advertised Morbr maximum TTL/);
-  await assert.rejects(createButchrd({ local: {
-    capabilities: true, providers: { local: provider }, freshness: { upstream: [5, 7] },
-    morbrMaximumTtlMs: 7, pollIntervalMs: 7,
-  } }).start({ watches: [{ provider: "local", resource: "desired" }] }), /strictly greater/);
+  const envelope = { contractVersion: "1.0", kind: "snapshot", subscriptionId: "resource", streamEpoch: 1, sequence: 1, cursor: "freshness", subject: { kind: "resource", key: "opaque" }, data: { ok: true }, meta: { upstreamFreshness: { minimumMs: 4, maximumMs: 6, demandPollIntervalMs: 1 } } };
+  const transport = { subscribe: async ({ onEnvelope }) => { onEnvelope(envelope); return { close() {} }; } };
+  const local = { capabilities: true, providers: { local: provider }, transport, freshness: { pull: [100, 100], upstream: [4, 6], push: [4, 6] } };
+  const rejected = createButchrd({ local });
+  await assert.rejects(rejected.start({ mode: "connected", connectedSubscriptions: [{ id: "resource", subject: { kind: "resource", key: "opaque" }, watchMode: "resource", provider: "local", resource: "desired", downstreamTtlMs: 7 }] }), /strictly greater/);
+
+  const accepted = createButchrd({ local });
+  const service = await accepted.start({ mode: "connected", connectedSubscriptions: [{ id: "resource", subject: { kind: "resource", key: "opaque" }, watchMode: "resource", provider: "local", resource: "desired", downstreamTtlMs: 101 }] });
+  service.stop();
 });
 
 test("terminal revocation hides only connected-origin cache entries and cannot start a late fallback timer", async () => {
@@ -193,6 +193,7 @@ test("terminal revocation hides only connected-origin cache entries and cannot s
   ] });
   assert.equal(daemon.monitoring.cacheEntry("local", "protected"), undefined);
   await assert.rejects(daemon.monitoring.read("local", "protected"), /FORBIDDEN/);
+  assert.throws(() => daemon.monitoring.watchResource("local", "protected", () => {}), /FORBIDDEN/);
   assert.deepEqual(daemon.monitoring.cacheEntry("local", "unrelated").value, { local: "kept" });
   await delay(20);
   assert.equal(calls, 0, "synchronous revocation leaves no fallback watch or interval alive");

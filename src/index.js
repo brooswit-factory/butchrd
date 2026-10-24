@@ -40,7 +40,10 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     },
     cacheEntry: (provider, resource) => blockedConnectedResources.has(canonicalResourceId(provider, resource))
       ? undefined : monitoring.cacheEntry(provider, resource),
-    watchResource: (...args) => monitoring.watchResource(...args),
+    watchResource: (provider, resource, listener) => {
+      if (blockedConnectedResources.has(canonicalResourceId(provider, resource))) throw terminalAccessError();
+      return monitoring.watchResource(provider, resource, listener);
+    },
     watchQuery: (...args) => monitoring.watchQuery(...args),
     receive: (...args) => monitoring.receive(...args),
     reconnect: (...args) => monitoring.reconnect(...args),
@@ -69,9 +72,9 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     handle.close();
   }
 
-  function openSubscription({ id = randomUUID(), subject, watchMode, transport } = {}) {
+  function openSubscription({ id = randomUUID(), subject, watchMode, transport, provider, resource, downstreamTtlMs } = {}) {
     if (!subject || !watchMode) throw new TypeError("subject and watchMode are required");
-    const subscription = { id, subject, watchMode, transport, epoch: 1, sequence: 0, state: null, closed: false };
+    const subscription = { id, subject, watchMode, transport, provider, resource, downstreamTtlMs, epoch: 1, sequence: 0, state: null, closed: false };
     subscriptions.set(id, subscription);
     report("subscription-opened", { id, subject, watchMode, epoch: 1 });
     return { ...subscription };
@@ -119,6 +122,7 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     if (envelope.cursor && seenCursors.has(`${envelope.subscriptionId}:${envelope.cursor}`)) return { accepted: false, duplicate: true };
     if (envelope.streamEpoch < subscription.epoch || (envelope.streamEpoch === subscription.epoch && envelope.sequence <= subscription.sequence)) return { accepted: false, stale: true };
     if (!subscription.ready && envelope.kind === "change") return { accepted: false, reason: "snapshot-required" };
+    if (subscription.provider && envelope.subject?.kind === "resource") validateResourceFreshness(subscription, envelope.meta?.upstreamFreshness);
     if (envelope.cursor) seenCursors.add(`${envelope.subscriptionId}:${envelope.cursor}`);
     subscription.epoch = envelope.streamEpoch;
     subscription.sequence = envelope.sequence;
@@ -176,19 +180,6 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     if (mode === "connected" && typeof local.transport.subscribe !== "function") throw new TypeError("connected transport must implement subscribe");
     lifecycleStopped = false;
     const locallyCapable = local.capabilities === true && Object.keys(localProviders).length > 0;
-    if (locallyCapable && local.pollIntervalMs !== undefined) {
-      const upstreamRange = local.freshness?.upstream;
-      if (!Array.isArray(upstreamRange) || upstreamRange.length !== 2 || !upstreamRange.every(Number.isFinite)) {
-        throw new TypeError("local fallback polling requires an explicit finite upstream freshness range");
-      }
-      if (local.morbrMaximumTtlMs !== upstreamRange[1]) {
-        throw new RangeError("advertised Morbr maximum TTL must equal the configured upstream freshness maximum");
-      }
-      assertFreshnessSeparation({
-        morbrMaximum: upstreamRange[1],
-        butchrdMinimum: local.pollIntervalMs,
-      });
-    }
     const applyWatch = event => {
       const result = receive(event);
       if (result.accepted && Array.isArray(event.data?.desired)) {
@@ -204,11 +195,6 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
         }
       }
       if (!subscriptions.has(subscription.id)) openSubscription(subscription);
-      const opened = subscriptions.get(subscription.id);
-      if (opened && subscription.provider) {
-        opened.provider = subscription.provider;
-        opened.resource = subscription.resource;
-      }
     }
     if (mode === "connected") {
       const transport = await local.transport.subscribe({ deploymentId, instanceId, onEnvelope: applyWatch });
@@ -264,6 +250,28 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     // caller still receives the rejected job and watch callers report it.
     reconciliation = job.catch(() => {});
     return job;
+  }
+
+  function validateResourceFreshness(subscription, upstreamFreshness) {
+    if (!upstreamFreshness) return;
+    const { minimumMs, maximumMs } = upstreamFreshness;
+    if (!Number.isFinite(minimumMs) || !Number.isFinite(maximumMs) || minimumMs < 0 || maximumMs < minimumMs) {
+      throw new TypeError("received upstreamFreshness must contain finite ordered millisecond bounds");
+    }
+    if (subscription.downstreamTtlMs === undefined) return;
+    const ranges = local.freshness;
+    const names = ["pull", "upstream", "push"];
+    if (!ranges || names.some(name => !Array.isArray(ranges[name]) || ranges[name].length !== 2 || !ranges[name].every(Number.isFinite))) {
+      throw new TypeError("downstream TTL validation requires explicit pull, upstream, and push freshness ranges");
+    }
+    const effectiveMaximum = Math.max(...names.map(name => ranges[name][1]));
+    // This is an actual downstream cache TTL, not the fallback timer.  It
+    // must cover both the received central bound and every local source that
+    // can keep an entry fresh.
+    assertFreshnessSeparation({
+      morbrMaximum: Math.max(maximumMs, effectiveMaximum),
+      butchrdMinimum: subscription.downstreamTtlMs,
+    });
   }
 
   async function reconcileNow({ desired = [], running = [], resting = [] } = {}) {
