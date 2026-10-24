@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createButchrd } from "../src/index.js";
+import { createButchrd, createFileStore } from "../src/index.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const config = id => ({ contractVersion: "1.0", kind: "snapshot", subscriptionId: id, streamEpoch: 1, sequence: 1, cursor: "c1", subject: { kind: "config", key: "daemon" }, data: { pollMs: 1000 } });
 
@@ -73,4 +76,10 @@ test("runnable controller reconciles adopted work, preserves held/resting exclus
   assert.deepEqual(await daemon.reconcile({ desired: [{ id: "adopted" }, { id: "held", held: true }], running: ["old", "resting"], resting: ["resting"] }), { spawned: ["adopted"], stopped: ["old"] });
   assert.deepEqual(calls, ["run:adopted", "stop:old"]);
   const service = await daemon.start(); service.stop(); assert.deepEqual(daemon.activity.slice(-2).map(e => e.kind), ["daemon-started", "daemon-stopped"]);
+});
+
+test("file store survives process-style restart with a new instance identity", () => {
+  const dir = mkdtempSync(join(tmpdir(), "butchrd-")); const path = join(dir, "state.json");
+  const first = createButchrd({ store: createFileStore(path) }); const second = createButchrd({ store: createFileStore(path) });
+  assert.equal(first.deploymentId, second.deploymentId); assert.notEqual(first.instanceId, second.instanceId); rmSync(dir, { recursive: true });
 });

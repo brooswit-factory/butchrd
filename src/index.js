@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createMorbin } from "@brooswit-factory/morbin";
 
 const TERMINAL_CODES = new Set(["UNAUTHORIZED", "FORBIDDEN"]);
@@ -142,4 +143,13 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
 function memoryStore() {
   const values = new Map();
   return { get: key => values.get(key), set: (key, value) => values.set(key, value) };
+}
+
+/** A tiny JSON store for deployment identity and last accepted local config. */
+export function createFileStore(path) {
+  const values = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {};
+  return {
+    get: key => values[key],
+    set: (key, value) => { values[key] = value; writeFileSync(path, JSON.stringify(values)); },
+  };
 }
