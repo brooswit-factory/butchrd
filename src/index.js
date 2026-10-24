@@ -60,6 +60,15 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     if (revoked) return { accepted: false, terminal: true };
     const subscription = subscriptions.get(envelope.subscriptionId);
     if (!subscription) return { accepted: false, reason: "unknown-subscription" };
+    if (envelope.kind === "reset") {
+      if (envelope.streamEpoch < subscription.epoch) return { accepted: false, stale: true };
+      subscription.epoch = envelope.streamEpoch;
+      subscription.sequence = envelope.sequence;
+      subscription.ready = false;
+      subscription.state = null;
+      report("envelope-received", { subscriptionId: envelope.subscriptionId, kind: envelope.kind });
+      return { accepted: true, reset: true };
+    }
     if (envelope.cursor && seenCursors.has(`${envelope.subscriptionId}:${envelope.cursor}`)) return { accepted: false, duplicate: true };
     if (envelope.streamEpoch < subscription.epoch || (envelope.streamEpoch === subscription.epoch && envelope.sequence <= subscription.sequence)) return { accepted: false, stale: true };
     if (!subscription.ready && envelope.kind === "change") return { accepted: false, reason: "snapshot-required" };
@@ -83,7 +92,7 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     if (!authorized) return receive({ contractVersion: "1.0", code: "UNAUTHORIZED" });
     sub.epoch += 1;
     sub.sequence = 0;
-    sub.ready = replayAvailable;
+    if (!replayAvailable) sub.ready = false;
     if (!replayAvailable) report("reset-required", { subscriptionId: id, epoch: sub.epoch });
     return { subscriptionId: id, streamEpoch: sub.epoch, resetRequired: !replayAvailable };
   }

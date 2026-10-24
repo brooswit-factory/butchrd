@@ -49,3 +49,13 @@ test("resets sequence on reconnect, requires replacement snapshots after gaps, a
   daemon.reconnect(sub.id, { replayAvailable: false });
   assert.deepEqual(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 3, sequence: 1, cursor: "c4", data: { version: 3 } }), { accepted: false, reason: "snapshot-required" });
 });
+
+test("ordinary reconnect preserves unready state and reset requires a replacement snapshot", () => {
+  const daemon = createButchrd(); const sub = daemon.openSubscription({ subject: { kind: "config", key: "daemon" }, watchMode: "resource" });
+  daemon.reconnect(sub.id);
+  assert.deepEqual(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 2, sequence: 1, cursor: "n1", data: { version: 1 } }), { accepted: false, reason: "snapshot-required" });
+  assert.equal(daemon.receive({ ...config(sub.id), streamEpoch: 2, sequence: 2, cursor: "n2", data: { version: 1 } }).accepted, true);
+  daemon.reconnect(sub.id);
+  assert.deepEqual(daemon.receive({ contractVersion: "1.0", kind: "reset", subscriptionId: sub.id, streamEpoch: 3, sequence: 1, cursor: null, subject: { kind: "config", key: "daemon" }, data: null }), { accepted: true, reset: true });
+  assert.deepEqual(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 3, sequence: 2, cursor: "n3", data: { version: 2 } }), { accepted: false, reason: "snapshot-required" });
+});
