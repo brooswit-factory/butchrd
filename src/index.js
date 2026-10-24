@@ -70,7 +70,7 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     if (envelope.kind === "change" && envelope.data?.operation === "remove") subscription.state = null;
     if (envelope.subject?.kind === "config") {
       const version = envelope.data?.version ?? envelope.data?.configVersion ?? 0;
-      if (version < connectedConfigVersion) return { accepted: false, stale: true };
+      if (version <= connectedConfigVersion) return { accepted: false, stale: true };
       if (envelope.kind === "snapshot" || envelope.kind === "change") { connectedConfig = envelope.data; connectedConfigVersion = version; }
     }
     report("envelope-received", { subscriptionId: envelope.subscriptionId, kind: envelope.kind });
@@ -82,6 +82,8 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     if (!sub) throw new Error(`unknown subscription ${id}`);
     if (!authorized) return receive({ contractVersion: "1.0", code: "UNAUTHORIZED" });
     sub.epoch += 1;
+    sub.sequence = 0;
+    sub.ready = replayAvailable;
     if (!replayAvailable) report("reset-required", { subscriptionId: id, epoch: sub.epoch });
     return { subscriptionId: id, streamEpoch: sub.epoch, resetRequired: !replayAvailable };
   }

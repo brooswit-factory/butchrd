@@ -38,3 +38,14 @@ test("uses Morbin-shaped terminal errors, closes transports, and executes fake w
   assert.equal(closed, 1); assert.equal(await daemon.runWork({ id: "work-1" }), "work-1");
   assert.deepEqual(activity.map(e => e.kind), ["subscription-opened", "connection-terminal", "work-started", "work-finished"]);
 });
+
+test("resets sequence on reconnect, requires replacement snapshots after gaps, and ignores equal config versions", () => {
+  const daemon = createButchrd(); const sub = daemon.openSubscription({ subject: { kind: "config", key: "daemon" }, watchMode: "resource" });
+  assert.equal(daemon.receive({ ...config(sub.id), sequence: 42, data: { version: 1, pollMs: 1000 } }).accepted, true);
+  daemon.reconnect(sub.id);
+  assert.equal(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 2, sequence: 1, cursor: "c2", data: { version: 2, pollMs: 2000 } }).accepted, true);
+  assert.deepEqual(daemon.effectiveConfig(), { version: 2, pollMs: 2000 });
+  assert.deepEqual(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 2, sequence: 2, cursor: "c3", data: { version: 2, pollMs: 9999 } }), { accepted: false, stale: true });
+  daemon.reconnect(sub.id, { replayAvailable: false });
+  assert.deepEqual(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 3, sequence: 1, cursor: "c4", data: { version: 3 } }), { accepted: false, reason: "snapshot-required" });
+});
