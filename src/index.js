@@ -270,6 +270,19 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
       morbrMaximum: maximumMs,
       butchrdMinimum: upstreamRange[0],
     });
+    // If this resource can later fall back to a local provider, Morbin stores
+    // that refresh as `pull`; its real TTL must preserve the same separation.
+    // Do not impose this on connected-only consumers with no local capability.
+    if (local.capabilities === true && localProviders[subscription.provider]) {
+      const pullRange = local.freshness?.pull;
+      if (!Array.isArray(pullRange) || pullRange.length !== 2 || !pullRange.every(Number.isFinite)) {
+        throw new TypeError("local fallback requires an explicit finite pull freshness range");
+      }
+      assertFreshnessSeparation({
+        morbrMaximum: maximumMs,
+        butchrdMinimum: pullRange[0],
+      });
+    }
   }
 
   async function reconcileNow({ desired = [], running = [], resting = [] } = {}) {
