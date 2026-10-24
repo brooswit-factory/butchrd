@@ -59,3 +59,11 @@ test("ordinary reconnect preserves unready state and reset requires a replacemen
   assert.deepEqual(daemon.receive({ contractVersion: "1.0", kind: "reset", subscriptionId: sub.id, streamEpoch: 3, sequence: 1, cursor: null, subject: { kind: "config", key: "daemon" }, data: null }), { accepted: true, reset: true });
   assert.deepEqual(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 3, sequence: 2, cursor: "n3", data: { version: 2 } }), { accepted: false, reason: "snapshot-required" });
 });
+
+test("a delayed reset cannot undo its replacement snapshot", () => {
+  const daemon = createButchrd(); const sub = daemon.openSubscription({ subject: { kind: "config", key: "daemon" }, watchMode: "resource" });
+  assert.equal(daemon.receive({ ...config(sub.id), data: { version: 1 } }).accepted, true); daemon.reconnect(sub.id, { replayAvailable: false });
+  const reset = { contractVersion: "1.0", kind: "reset", subscriptionId: sub.id, streamEpoch: 2, sequence: 1, cursor: "r1", subject: { kind: "config", key: "daemon" }, data: null };
+  assert.equal(daemon.receive(reset).accepted, true); assert.equal(daemon.receive({ ...config(sub.id), streamEpoch: 2, sequence: 2, cursor: "s2", data: { version: 2 } }).accepted, true);
+  assert.equal(daemon.receive(reset).accepted, false); assert.equal(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 2, sequence: 3, cursor: "c3", data: { version: 3 } }).accepted, true);
+});

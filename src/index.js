@@ -61,7 +61,9 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     const subscription = subscriptions.get(envelope.subscriptionId);
     if (!subscription) return { accepted: false, reason: "unknown-subscription" };
     if (envelope.kind === "reset") {
-      if (envelope.streamEpoch < subscription.epoch) return { accepted: false, stale: true };
+      if (envelope.cursor && seenCursors.has(`${envelope.subscriptionId}:${envelope.cursor}`)) return { accepted: false, duplicate: true };
+      if (envelope.streamEpoch < subscription.epoch || (envelope.streamEpoch === subscription.epoch && envelope.sequence <= subscription.sequence)) return { accepted: false, stale: true };
+      if (envelope.cursor) seenCursors.add(`${envelope.subscriptionId}:${envelope.cursor}`);
       subscription.epoch = envelope.streamEpoch;
       subscription.sequence = envelope.sequence;
       subscription.ready = false;
