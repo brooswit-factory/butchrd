@@ -30,3 +30,11 @@ test("reports lifecycle activity to fake workers and replaces changed streams", 
   const second = daemon.replaceSubscription(first.id, { subject: { kind: "query", key: "b" }, watchMode: "query-content" });
   assert.notEqual(first.id, second.id); assert.equal(events.filter(e => e.kind === "subscription-opened").length, 2);
 });
+
+test("uses Morbin-shaped terminal errors, closes transports, and executes fake work", async () => {
+  let closed = 0; const activity = []; const daemon = createButchrd({ workers: { execute: async work => work.id, reportActivity: e => activity.push(e) } });
+  const sub = daemon.openSubscription({ subject: { kind: "resource", key: "a" }, watchMode: "resource", transport: { close: () => { closed += 1; } } });
+  assert.deepEqual(daemon.receive({ contractVersion: "1.0", kind: "error", error: { code: "FORBIDDEN" } }), { accepted: false, terminal: true });
+  assert.equal(closed, 1); assert.equal(await daemon.runWork({ id: "work-1" }), "work-1");
+  assert.deepEqual(activity.map(e => e.kind), ["subscription-opened", "connection-terminal", "work-started", "work-finished"]);
+});

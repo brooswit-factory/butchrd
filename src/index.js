@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { createMorbin } from "@brooswit-factory/morbin";
 
 const TERMINAL_CODES = new Set(["UNAUTHORIZED", "FORBIDDEN"]);
 
@@ -7,7 +8,7 @@ const TERMINAL_CODES = new Set(["UNAUTHORIZED", "FORBIDDEN"]);
  * optional Morbr-compatible transport; no central credential is accepted or
  * retained by this module.
  */
-export function createButchrd({ store = memoryStore(), workers = {}, local = {} } = {}) {
+export function createButchrd({ store = memoryStore(), workers = {}, local = {}, morbin } = {}) {
   const deploymentId = store.get("deploymentId") ?? randomUUID();
   store.set("deploymentId", deploymentId);
   const instanceId = randomUUID();
@@ -15,7 +16,10 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {} 
   const seenCursors = new Set();
   const activity = [];
   let connectedConfig = null;
+  let connectedConfigVersion = -1;
   let revoked = false;
+  // The shared library owns provider monitoring/freshness; this daemon never polls a provider itself.
+  const monitoring = morbin ?? createMorbin({ providers: local.providers ?? {} });
 
   function report(kind, data = {}) {
     const event = { kind, data, deploymentId, instanceId };
@@ -42,11 +46,14 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {} 
   }
 
   function receive(envelope) {
-    if (TERMINAL_CODES.has(envelope.code)) {
+    const terminalCode = envelope.error?.code ?? envelope.code;
+    if (TERMINAL_CODES.has(terminalCode)) {
       revoked = true;
+      for (const subscription of subscriptions.values()) subscription.transport?.close?.();
       subscriptions.clear();
       connectedConfig = null;
-      report("connection-terminal", { code: envelope.code });
+      connectedConfigVersion = -1;
+      report("connection-terminal", { code: terminalCode });
       return { accepted: false, terminal: true };
     }
     if (envelope.contractVersion?.split(".")[0] !== "1") throw new Error("incompatible contract version");
@@ -54,12 +61,18 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {} 
     const subscription = subscriptions.get(envelope.subscriptionId);
     if (!subscription) return { accepted: false, reason: "unknown-subscription" };
     if (envelope.cursor && seenCursors.has(`${envelope.subscriptionId}:${envelope.cursor}`)) return { accepted: false, duplicate: true };
+    if (envelope.streamEpoch < subscription.epoch || (envelope.streamEpoch === subscription.epoch && envelope.sequence <= subscription.sequence)) return { accepted: false, stale: true };
+    if (!subscription.ready && envelope.kind === "change") return { accepted: false, reason: "snapshot-required" };
     if (envelope.cursor) seenCursors.add(`${envelope.subscriptionId}:${envelope.cursor}`);
     subscription.epoch = envelope.streamEpoch;
     subscription.sequence = envelope.sequence;
-    if (envelope.kind === "snapshot") subscription.state = envelope.data;
+    if (envelope.kind === "snapshot") { subscription.state = envelope.data; subscription.ready = true; }
     if (envelope.kind === "change" && envelope.data?.operation === "remove") subscription.state = null;
-    if (envelope.subject?.kind === "config" && envelope.kind === "snapshot") connectedConfig = envelope.data;
+    if (envelope.subject?.kind === "config") {
+      const version = envelope.data?.version ?? envelope.data?.configVersion ?? 0;
+      if (version < connectedConfigVersion) return { accepted: false, stale: true };
+      if (envelope.kind === "snapshot" || envelope.kind === "change") { connectedConfig = envelope.data; connectedConfigVersion = version; }
+    }
     report("envelope-received", { subscriptionId: envelope.subscriptionId, kind: envelope.kind });
     return { accepted: true };
   }
@@ -78,9 +91,16 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {} 
     return { ...connectedConfig, ...(local.capabilities ? local.config : {}) };
   }
 
+  async function runWork(work) {
+    if (typeof workers.execute !== "function") throw new TypeError("workers.execute is required to run work");
+    report("work-started", { id: work.id });
+    try { const result = await workers.execute(work); report("work-finished", { id: work.id }); return result; }
+    catch (error) { report("work-failed", { id: work.id }); throw error; }
+  }
+
   return {
     daemon: "butchrd", deploymentId, instanceId, openSubscription, replaceSubscription,
-    receive, reconnect, effectiveConfig, reportActivity: report,
+    receive, reconnect, effectiveConfig, runWork, monitoring, reportActivity: report,
     get activity() { return [...activity]; },
     get connected() { return !revoked && connectedConfig !== null; },
   };

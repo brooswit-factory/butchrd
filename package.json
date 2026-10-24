@@ -4,6 +4,9 @@
   "private": false,
   "type": "module",
   "exports": "./src/index.js",
+  "dependencies": {
+    "@brooswit-factory/morbin": "file:../morbin"
+  },
   "scripts": {
     "build": "node --check src/index.js",
     "test": "node --test"
