@@ -111,9 +111,29 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     catch (error) { report("work-failed", { id: work.id }); throw error; }
   }
 
+  async function start({ mode = "standalone", watches = [] } = {}) {
+    if (mode === "connected" && !local.transport) throw new Error("connected mode requires a configured transport");
+    const handles = watches.map(({ provider, resource, query, mode: watchMode = "resource" }) =>
+      resource !== undefined
+        ? monitoring.watchResource(provider, resource, receive)
+        : monitoring.watchQuery(provider, query, watchMode === "query-membership" ? "membership" : "content", receive));
+    report("daemon-started", { mode });
+    return { mode, stop: () => { for (const handle of handles) handle.close(); report("daemon-stopped", { mode }); } };
+  }
+
+  async function reconcile({ desired = [], running = [], resting = [] } = {}) {
+    const want = new Map(desired.filter(work => !work.held).map(work => [work.id, work]));
+    const have = new Set(running); const asleep = new Set(resting);
+    const spawned = [];
+    for (const [id, work] of want) if (!have.has(id)) { await runWork(work); spawned.push(id); }
+    const stopped = [];
+    for (const id of have) if (!want.has(id) && !asleep.has(id)) { await workers.stop?.(id); stopped.push(id); }
+    return { spawned, stopped };
+  }
+
   return {
     daemon: "butchrd", deploymentId, instanceId, openSubscription, replaceSubscription,
-    receive, reconnect, effectiveConfig, runWork, monitoring, reportActivity: report,
+    receive, reconnect, effectiveConfig, runWork, start, reconcile, monitoring, reportActivity: report,
     get activity() { return [...activity]; },
     get connected() { return !revoked && connectedConfig !== null; },
   };

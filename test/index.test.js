@@ -67,3 +67,10 @@ test("a delayed reset cannot undo its replacement snapshot", () => {
   assert.equal(daemon.receive(reset).accepted, true); assert.equal(daemon.receive({ ...config(sub.id), streamEpoch: 2, sequence: 2, cursor: "s2", data: { version: 2 } }).accepted, true);
   assert.equal(daemon.receive(reset).accepted, false); assert.equal(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 2, sequence: 3, cursor: "c3", data: { version: 3 } }).accepted, true);
 });
+
+test("runnable controller reconciles adopted work, preserves held/resting exclusions, and stops cleanly", async () => {
+  const calls = []; const daemon = createButchrd({ workers: { execute: async work => calls.push(`run:${work.id}`), stop: async id => calls.push(`stop:${id}`) } });
+  assert.deepEqual(await daemon.reconcile({ desired: [{ id: "adopted" }, { id: "held", held: true }], running: ["old", "resting"], resting: ["resting"] }), { spawned: ["adopted"], stopped: ["old"] });
+  assert.deepEqual(calls, ["run:adopted", "stop:old"]);
+  const service = await daemon.start(); service.stop(); assert.deepEqual(daemon.activity.slice(-2).map(e => e.kind), ["daemon-started", "daemon-stopped"]);
+});
