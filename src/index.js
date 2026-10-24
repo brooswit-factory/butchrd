@@ -17,6 +17,8 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
   const seenCursors = new Set();
   const activity = [];
   const activeWork = new Map();
+  const activeHandles = new Set();
+  const closedHandles = new WeakSet();
   let lifecycleStopped = false;
   let reconciliation = Promise.resolve();
   let connectedConfig = null;
@@ -30,6 +32,21 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     activity.push(event);
     workers.reportActivity?.(event);
     return event;
+  }
+
+  function shutdown() {
+    if (lifecycleStopped) return false;
+    lifecycleStopped = true;
+    for (const handle of activeHandles) closeHandle(handle);
+    activeHandles.clear();
+    for (const id of activeWork.keys()) void workers.stop?.(id);
+    return true;
+  }
+
+  function closeHandle(handle) {
+    if (!handle?.close || closedHandles.has(handle)) return;
+    closedHandles.add(handle);
+    handle.close();
   }
 
   function openSubscription({ id = randomUUID(), subject, watchMode, transport } = {}) {
@@ -53,7 +70,8 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
     const terminalCode = envelope.error?.code ?? envelope.code;
     if (TERMINAL_CODES.has(terminalCode)) {
       revoked = true;
-      for (const subscription of subscriptions.values()) subscription.transport?.close?.();
+      shutdown();
+      for (const subscription of subscriptions.values()) closeHandle(subscription.transport);
       subscriptions.clear();
       connectedConfig = null;
       connectedConfigVersion = -1;
@@ -129,16 +147,20 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
       }
       return result;
     };
-    const handles = [];
     for (const subscription of connectedSubscriptions) {
       if (!subscriptions.has(subscription.id)) openSubscription(subscription);
     }
     if (mode === "connected") {
       const transport = await local.transport.subscribe({ deploymentId, instanceId, onEnvelope: applyWatch });
       if (!transport?.close) throw new TypeError("connected transport subscription must return a closeable handle");
-      handles.push(transport);
+      // A synchronous authorization failure can arrive from subscribe() before
+      // its handle is returned. Close that late handle rather than reviving a
+      // terminal transport after shutdown.
+      if (lifecycleStopped) closeHandle(transport);
+      else activeHandles.add(transport);
     }
     for (const { provider, resource, query, mode: watchMode = "resource" } of watches) {
+      if (lifecycleStopped) break;
       const handle = resource !== undefined
         ? monitoring.watchResource(provider, resource, applyWatch)
         : monitoring.watchQuery(provider, query, watchMode === "query-membership" ? "membership" : "content", applyWatch);
@@ -152,19 +174,17 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
           transport: handle,
         });
       }
-      handles.push(handle);
+      if (lifecycleStopped) closeHandle(handle);
+      else activeHandles.add(handle);
     }
     report("daemon-started", { mode });
     let stopped = false;
     return {
       mode,
       stop: () => {
-        if (stopped) return;
+        if (stopped || lifecycleStopped) return;
         stopped = true;
-        lifecycleStopped = true;
-        for (const handle of handles) handle.close();
-        for (const id of activeWork.keys()) void workers.stop?.(id);
-        report("daemon-stopped", { mode });
+        if (shutdown()) report("daemon-stopped", { mode });
       },
     };
   }

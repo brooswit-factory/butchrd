@@ -109,6 +109,19 @@ test("connected mode subscribes, consumes versioned config envelopes, and closes
   service.stop(); assert.equal(closed, 1);
 });
 
+test("terminal authorization during synchronous connected subscribe closes the late handle", async () => {
+  let closed = 0;
+  const transport = { subscribe: ({ onEnvelope }) => {
+    assert.deepEqual(onEnvelope({ contractVersion: "1.0", code: "FORBIDDEN" }), { accepted: false, terminal: true });
+    return { close: () => { closed += 1; } };
+  } };
+  const daemon = createButchrd({ local: { transport } });
+  const service = await daemon.start({ mode: "connected" });
+  assert.equal(closed, 1);
+  assert.equal(daemon.connected, false);
+  service.stop(); assert.equal(closed, 1, "terminal shutdown is idempotent");
+});
+
 test("reconciliation avoids duplicate in-flight work and does not dispatch queued work after stop", async () => {
   let release; const calls = [];
   const gate = new Promise(resolve => { release = resolve; });
@@ -214,5 +227,31 @@ test("CLI consumes configured connected config snapshots and changes", async t =
   cli.child.kill("SIGTERM");
   assert.deepEqual(await waitForExit(cli.child), { code: 0, signal: null });
   assert.equal(cli.stderr(), "");
+  rmSync(dir, { recursive: true });
+});
+
+test("CLI terminal revocation stops protected work, closes transport, and exits", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "butchrd-revoked-"));
+  const state = join(dir, "state.json"); const eventFile = join(dir, "transport.json");
+  const activityFile = join(dir, "activity.jsonl"); const workLog = join(dir, "work.jsonl"); const configPath = join(dir, "config.json");
+  const desired = [{ id: "fake-a" }, { id: "fake-b" }];
+  const resourceSnapshot = { contractVersion: "1.0", kind: "snapshot", subscriptionId: "resource-sub", streamEpoch: 1, sequence: 1, cursor: "resource-1", subject: { kind: "resource", key: "desired" }, data: { desired } };
+  writeFileSync(eventFile, JSON.stringify({ envelopes: [resourceSnapshot] }));
+  writeFileSync(configPath, JSON.stringify({
+    mode: "connected", fakeTransport: { eventFile }, activityFile,
+    fakeWorker: { logFile: workLog, delayMs: 300 },
+    connectedSubscriptions: [{ id: "resource-sub", subject: { kind: "resource", key: "desired" }, watchMode: "resource" }],
+  }));
+  const cli = startCli(["--state", state, "--config", configPath]);
+  t.after(() => { if (cli.child.exitCode === null) cli.child.kill("SIGKILL"); });
+  await eventually(() => assert.match(cli.stdout(), /deploymentId/));
+  await eventually(() => assert.match(readFileSync(workLog, "utf8"), /"execute","id":"fake-a"/));
+  writeFileSync(eventFile, JSON.stringify({ contractVersion: "1.0", code: "FORBIDDEN" }));
+  assert.deepEqual(await waitForExit(cli.child), { code: 0, signal: null });
+  assert.equal(cli.stderr(), "");
+  const activity = readFileSync(activityFile, "utf8"); const work = readFileSync(workLog, "utf8");
+  assert.match(activity, /connection-terminal/);
+  assert.match(work, /"stop","id":"fake-a"/);
+  assert.doesNotMatch(work, /fake-b/);
   rmSync(dir, { recursive: true });
 });
