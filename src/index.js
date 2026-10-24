@@ -16,6 +16,7 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
   const subscriptions = new Map();
   const seenCursors = new Set();
   const activity = [];
+  const activeWork = new Map();
   let connectedConfig = null;
   let connectedConfigVersion = -1;
   let revoked = false;
@@ -107,9 +108,11 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
 
   async function runWork(work) {
     if (typeof workers.execute !== "function") throw new TypeError("workers.execute is required to run work");
+    activeWork.set(work.id, work);
     report("work-started", { id: work.id });
     try { const result = await workers.execute(work); report("work-finished", { id: work.id }); return result; }
     catch (error) { report("work-failed", { id: work.id }); throw error; }
+    finally { activeWork.delete(work.id); }
   }
 
   async function start({ mode = "standalone", watches = [] } = {}) {
@@ -119,12 +122,34 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
       if (result.accepted && Array.isArray(event.data?.desired)) void reconcile({ desired: event.data.desired, running: event.data.running ?? [], resting: event.data.resting ?? [] });
       return result;
     };
-    const handles = watches.map(({ provider, resource, query, mode: watchMode = "resource" }) =>
-      resource !== undefined
+    const handles = watches.map(({ provider, resource, query, mode: watchMode = "resource" }) => {
+      const handle = resource !== undefined
         ? monitoring.watchResource(provider, resource, applyWatch)
-        : monitoring.watchQuery(provider, query, watchMode === "query-membership" ? "membership" : "content", applyWatch));
+        : monitoring.watchQuery(provider, query, watchMode === "query-membership" ? "membership" : "content", applyWatch);
+      // Morbin owns the logical ID for a real watch. Register it before its
+      // asynchronous initial snapshot so the envelope is accepted by us.
+      if (handle.id && !subscriptions.has(handle.id)) {
+        openSubscription({
+          id: handle.id,
+          subject: resource !== undefined ? { kind: "resource", key: resource } : { kind: "query", key: query },
+          watchMode: resource !== undefined ? "resource" : watchMode,
+          transport: handle,
+        });
+      }
+      return handle;
+    });
     report("daemon-started", { mode });
-    return { mode, stop: () => { for (const handle of handles) handle.close(); report("daemon-stopped", { mode }); } };
+    let stopped = false;
+    return {
+      mode,
+      stop: () => {
+        if (stopped) return;
+        stopped = true;
+        for (const handle of handles) handle.close();
+        for (const id of activeWork.keys()) void workers.stop?.(id);
+        report("daemon-stopped", { mode });
+      },
+    };
   }
 
   async function reconcile({ desired = [], running = [], resting = [] } = {}) {

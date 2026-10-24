@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createButchrd, createFileStore } from "../src/index.js";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 
 const config = id => ({ contractVersion: "1.0", kind: "snapshot", subscriptionId: id, streamEpoch: 1, sequence: 1, cursor: "c1", subject: { kind: "config", key: "daemon" }, data: { pollMs: 1000 } });
 
@@ -90,4 +91,61 @@ test("a fake Morbin resource watch drives desired worker reconciliation", async 
   await daemon.start({ watches: [{ provider: "fake", resource: "desired" }] });
   listener({ contractVersion: "1.0", kind: "snapshot", subscriptionId: daemon.openSubscription({ subject: { kind: "resource", key: "desired" }, watchMode: "resource" }).id, streamEpoch: 1, sequence: 1, cursor: "d1", subject: { kind: "resource", key: "desired" }, data: { desired: [{ id: "from-provider" }] } });
   await new Promise(resolve => setImmediate(resolve)); assert.deepEqual(ran, ["from-provider"]);
+});
+
+const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+async function eventually(assertion, timeout = 2_000) {
+  const deadline = Date.now() + timeout;
+  let lastError;
+  while (Date.now() < deadline) {
+    try { return assertion(); } catch (error) { lastError = error; await delay(20); }
+  }
+  throw lastError;
+}
+
+function startCli(args) {
+  const child = spawn(process.execPath, ["src/cli.js", ...args], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = ""; let stderr = "";
+  child.stdout.on("data", chunk => { stdout += chunk; });
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  return { child, stdout: () => stdout, stderr: () => stderr };
+}
+
+function waitForExit(child, timeout = 2_000) {
+  return Promise.race([
+    new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal }))),
+    delay(timeout).then(() => { throw new Error("CLI did not exit within bounded interval"); }),
+  ]);
+}
+
+test("CLI keeps a configured fake Morbin transport alive and SIGTERM closes it", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "butchrd-cli-"));
+  const state = join(dir, "state.json"); const eventFile = join(dir, "event.json");
+  const activityFile = join(dir, "activity.jsonl"); const configPath = join(dir, "config.json");
+  writeFileSync(eventFile, JSON.stringify({ resource: "desired", value: { desired: [] }, cursor: "initial" }));
+  writeFileSync(configPath, JSON.stringify({
+    fakeProvider: { resources: { desired: { desired: [] } }, eventFile },
+    watches: [{ provider: "fake", resource: "desired" }], activityFile,
+  }));
+  const first = startCli(["--state", state, "--config", configPath]);
+  t.after(() => { if (first.child.exitCode === null) first.child.kill("SIGKILL"); });
+  await eventually(() => assert.match(first.stdout(), /deploymentId/));
+  assert.equal(first.child.exitCode, null, "the configured provider transport keeps the CLI alive");
+  await eventually(() => assert.match(readFileSync(activityFile, "utf8"), /envelope-received/));
+  writeFileSync(eventFile, JSON.stringify({ resource: "desired", value: { desired: [] }, cursor: "process-change", source: "push" }));
+  await eventually(() => assert.ok((readFileSync(activityFile, "utf8").match(/envelope-received/g) ?? []).length >= 2));
+  first.child.kill("SIGTERM");
+  assert.deepEqual(await waitForExit(first.child), { code: 0, signal: null });
+  assert.equal(first.stderr(), "");
+  const firstIdentity = JSON.parse(first.stdout().trim());
+  const second = startCli(["--state", state, "--config", configPath]);
+  t.after(() => { if (second.child.exitCode === null) second.child.kill("SIGKILL"); });
+  await eventually(() => assert.match(second.stdout(), /deploymentId/));
+  second.child.kill("SIGTERM");
+  assert.deepEqual(await waitForExit(second.child), { code: 0, signal: null });
+  const secondIdentity = JSON.parse(second.stdout().trim());
+  assert.equal(firstIdentity.deploymentId, secondIdentity.deploymentId);
+  assert.notEqual(firstIdentity.instanceId, secondIdentity.instanceId);
+  assert.equal(second.stderr(), "");
+  rmSync(dir, { recursive: true });
 });
