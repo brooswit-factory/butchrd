@@ -114,10 +114,15 @@ export function createButchrd({ store = memoryStore(), workers = {}, local = {},
 
   async function start({ mode = "standalone", watches = [] } = {}) {
     if (mode === "connected" && !local.transport) throw new Error("connected mode requires a configured transport");
+    const applyWatch = event => {
+      const result = receive(event);
+      if (result.accepted && Array.isArray(event.data?.desired)) void reconcile({ desired: event.data.desired, running: event.data.running ?? [], resting: event.data.resting ?? [] });
+      return result;
+    };
     const handles = watches.map(({ provider, resource, query, mode: watchMode = "resource" }) =>
       resource !== undefined
-        ? monitoring.watchResource(provider, resource, receive)
-        : monitoring.watchQuery(provider, query, watchMode === "query-membership" ? "membership" : "content", receive));
+        ? monitoring.watchResource(provider, resource, applyWatch)
+        : monitoring.watchQuery(provider, query, watchMode === "query-membership" ? "membership" : "content", applyWatch));
     report("daemon-started", { mode });
     return { mode, stop: () => { for (const handle of handles) handle.close(); report("daemon-stopped", { mode }); } };
   }
