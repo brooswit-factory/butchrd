@@ -1,7 +1,371 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createButchrd } from "../src/index.js";
+import { createButchrd, createFileStore } from "../src/index.js";
+import { createMorbin } from "@brooswit-factory/morbin";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawn } from "node:child_process";
 
-test("creates the ButchrD daemon marker", () => {
-  assert.deepEqual(createButchrd(), { daemon: "butchrd" });
+const config = id => ({ contractVersion: "1.0", kind: "snapshot", subscriptionId: id, streamEpoch: 1, sequence: 1, cursor: "c1", subject: { kind: "config", key: "daemon" }, data: { pollMs: 1000 } });
+
+test("persists deployment identity while each start gets a new instance identity", () => {
+  const values = new Map(); const store = { get: k => values.get(k), set: (k, v) => values.set(k, v) };
+  const first = createButchrd({ store }); const second = createButchrd({ store });
+  assert.equal(first.deploymentId, second.deploymentId); assert.notEqual(first.instanceId, second.instanceId);
+});
+
+test("standalone operation has no Morbr dependency and only uses capable local config", () => {
+  assert.deepEqual(createButchrd({ local: { config: { unsafe: true } } }).effectiveConfig(), {});
+  assert.deepEqual(createButchrd({ local: { capabilities: true, config: { pollMs: 2000 } } }).effectiveConfig(), { pollMs: 2000 });
+});
+
+test("connected config, cursor dedupe, replay-gap reset and terminal revocation are safe", () => {
+  const daemon = createButchrd(); const sub = daemon.openSubscription({ subject: { kind: "config", key: "daemon" }, watchMode: "resource" });
+  assert.deepEqual(daemon.receive(config(sub.id)), { accepted: true });
+  assert.equal(daemon.connected, true); assert.deepEqual(daemon.receive(config(sub.id)), { accepted: false, duplicate: true });
+  assert.deepEqual(daemon.reconnect(sub.id, { replayAvailable: false }), { subscriptionId: sub.id, streamEpoch: 2, resetRequired: true });
+  assert.deepEqual(daemon.receive({ contractVersion: "1.0", code: "FORBIDDEN" }), { accepted: false, terminal: true });
+  assert.equal(daemon.connected, false); assert.deepEqual(daemon.receive(config(sub.id)), { accepted: false, terminal: true });
+});
+
+test("reports lifecycle activity to fake workers and replaces changed streams", () => {
+  const events = []; const daemon = createButchrd({ workers: { reportActivity: e => events.push(e) } });
+  const first = daemon.openSubscription({ subject: { kind: "query", key: "a" }, watchMode: "query-membership" });
+  const second = daemon.replaceSubscription(first.id, { subject: { kind: "query", key: "b" }, watchMode: "query-content" });
+  assert.notEqual(first.id, second.id); assert.equal(events.filter(e => e.kind === "subscription-opened").length, 2);
+});
+
+test("uses Morbin-shaped terminal errors, closes transports, and executes fake work", async () => {
+  let closed = 0; const activity = []; const daemon = createButchrd({ workers: { execute: async work => work.id, reportActivity: e => activity.push(e) } });
+  const sub = daemon.openSubscription({ subject: { kind: "resource", key: "a" }, watchMode: "resource", transport: { close: () => { closed += 1; } } });
+  assert.deepEqual(daemon.receive({ contractVersion: "1.0", kind: "error", error: { code: "FORBIDDEN" } }), { accepted: false, terminal: true });
+  assert.equal(closed, 1); assert.equal(await daemon.runWork({ id: "work-1" }), "work-1");
+  assert.deepEqual(activity.map(e => e.kind), ["subscription-opened", "connection-terminal", "work-started", "work-finished"]);
+});
+
+test("resets sequence on reconnect, requires replacement snapshots after gaps, and ignores equal config versions", () => {
+  const daemon = createButchrd(); const sub = daemon.openSubscription({ subject: { kind: "config", key: "daemon" }, watchMode: "resource" });
+  assert.equal(daemon.receive({ ...config(sub.id), sequence: 42, data: { version: 1, pollMs: 1000 } }).accepted, true);
+  daemon.reconnect(sub.id);
+  assert.equal(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 2, sequence: 1, cursor: "c2", data: { version: 2, pollMs: 2000 } }).accepted, true);
+  assert.deepEqual(daemon.effectiveConfig(), { version: 2, pollMs: 2000 });
+  assert.deepEqual(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 2, sequence: 2, cursor: "c3", data: { version: 2, pollMs: 9999 } }), { accepted: false, stale: true });
+  daemon.reconnect(sub.id, { replayAvailable: false });
+  assert.deepEqual(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 3, sequence: 1, cursor: "c4", data: { version: 3 } }), { accepted: false, reason: "snapshot-required" });
+});
+
+test("ordinary reconnect preserves unready state and reset requires a replacement snapshot", () => {
+  const daemon = createButchrd(); const sub = daemon.openSubscription({ subject: { kind: "config", key: "daemon" }, watchMode: "resource" });
+  daemon.reconnect(sub.id);
+  assert.deepEqual(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 2, sequence: 1, cursor: "n1", data: { version: 1 } }), { accepted: false, reason: "snapshot-required" });
+  assert.equal(daemon.receive({ ...config(sub.id), streamEpoch: 2, sequence: 2, cursor: "n2", data: { version: 1 } }).accepted, true);
+  daemon.reconnect(sub.id);
+  assert.deepEqual(daemon.receive({ contractVersion: "1.0", kind: "reset", subscriptionId: sub.id, streamEpoch: 3, sequence: 1, cursor: null, subject: { kind: "config", key: "daemon" }, data: null }), { accepted: true, reset: true });
+  assert.deepEqual(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 3, sequence: 2, cursor: "n3", data: { version: 2 } }), { accepted: false, reason: "snapshot-required" });
+});
+
+test("a delayed reset cannot undo its replacement snapshot", () => {
+  const daemon = createButchrd(); const sub = daemon.openSubscription({ subject: { kind: "config", key: "daemon" }, watchMode: "resource" });
+  assert.equal(daemon.receive({ ...config(sub.id), data: { version: 1 } }).accepted, true); daemon.reconnect(sub.id, { replayAvailable: false });
+  const reset = { contractVersion: "1.0", kind: "reset", subscriptionId: sub.id, streamEpoch: 2, sequence: 1, cursor: "r1", subject: { kind: "config", key: "daemon" }, data: null };
+  assert.equal(daemon.receive(reset).accepted, true); assert.equal(daemon.receive({ ...config(sub.id), streamEpoch: 2, sequence: 2, cursor: "s2", data: { version: 2 } }).accepted, true);
+  assert.equal(daemon.receive(reset).accepted, false); assert.equal(daemon.receive({ ...config(sub.id), kind: "change", streamEpoch: 2, sequence: 3, cursor: "c3", data: { version: 3 } }).accepted, true);
+});
+
+test("runnable controller reconciles adopted work, preserves held/resting exclusions, and stops cleanly", async () => {
+  const calls = []; const daemon = createButchrd({ workers: { execute: async work => calls.push(`run:${work.id}`), stop: async id => calls.push(`stop:${id}`) } });
+  assert.deepEqual(await daemon.reconcile({ desired: [{ id: "adopted" }, { id: "held", held: true }], running: ["old", "resting"], resting: ["resting"] }), { spawned: ["adopted"], stopped: ["old"] });
+  assert.deepEqual(calls, ["run:adopted", "stop:old"]);
+  const service = await daemon.start(); service.stop(); assert.deepEqual(daemon.activity.slice(-2).map(e => e.kind), ["daemon-started", "daemon-stopped"]);
+});
+
+test("file store survives process-style restart with a new instance identity", () => {
+  const dir = mkdtempSync(join(tmpdir(), "butchrd-")); const path = join(dir, "state.json");
+  const first = createButchrd({ store: createFileStore(path) }); const second = createButchrd({ store: createFileStore(path) });
+  assert.equal(first.deploymentId, second.deploymentId); assert.notEqual(first.instanceId, second.instanceId); rmSync(dir, { recursive: true });
+});
+
+test("a fake Morbin resource watch drives desired worker reconciliation", async () => {
+  let listener; const ran = []; const monitoring = { watchResource: (_p, _r, next) => { listener = next; return { close() {} }; } };
+  const daemon = createButchrd({ morbin: monitoring, workers: { execute: async work => ran.push(work.id) } });
+  await daemon.start({ watches: [{ provider: "fake", resource: "desired" }] });
+  listener({ contractVersion: "1.0", kind: "snapshot", subscriptionId: daemon.openSubscription({ subject: { kind: "resource", key: "desired" }, watchMode: "resource" }).id, streamEpoch: 1, sequence: 1, cursor: "d1", subject: { kind: "resource", key: "desired" }, data: { desired: [{ id: "from-provider" }] } });
+  await new Promise(resolve => setImmediate(resolve)); assert.deepEqual(ran, ["from-provider"]);
+});
+
+test("connected mode subscribes, consumes versioned config envelopes, and closes its transport", async () => {
+  let request; let closed = 0;
+  const transport = { subscribe: async next => { request = next; return { close: () => { closed += 1; } }; } };
+  const daemon = createButchrd({ local: { transport } });
+  const service = await daemon.start({
+    mode: "connected",
+    connectedSubscriptions: [{ id: "config-sub", subject: { kind: "config", key: "daemon" }, watchMode: "resource" }],
+  });
+  assert.equal(request.deploymentId, daemon.deploymentId);
+  assert.equal(request.instanceId, daemon.instanceId);
+  assert.deepEqual(request.onEnvelope({ contractVersion: "1.0", kind: "snapshot", subscriptionId: "config-sub", streamEpoch: 1, sequence: 1, cursor: "config-1", subject: { kind: "config", key: "daemon" }, data: { version: 1, value: { pollMs: 1000 } } }), { accepted: true });
+  assert.equal(daemon.connected, true);
+  assert.deepEqual(daemon.effectiveConfig(), { version: 1, value: { pollMs: 1000 } });
+  service.stop(); assert.equal(closed, 1);
+});
+
+test("connected resource updates populate the mapped Morbin cache before a local read", async () => {
+  let fetches = 0;
+  const provider = { fetch: async () => { fetches += 1; return { value: "local" }; } };
+  const monitoring = createMorbin({
+    providers: { local: provider }, random: () => 0,
+    freshness: { upstream: [1_000, 1_000], pull: [100, 100] },
+  });
+  const transport = { subscribe: async ({ onEnvelope }) => {
+    onEnvelope({ contractVersion: "1.0", kind: "snapshot", subscriptionId: "resource-sub", streamEpoch: 1, sequence: 1, cursor: "upstream-1", subject: { kind: "resource", key: "opaque-central-subject" }, data: { value: "upstream" } });
+    return { close() {} };
+  } };
+  const daemon = createButchrd({ morbin: monitoring, local: { transport } });
+  const service = await daemon.start({
+    mode: "connected",
+    connectedSubscriptions: [{ id: "resource-sub", subject: { kind: "resource", key: "opaque-central-subject" }, watchMode: "resource", provider: "local", resource: "desired" }],
+  });
+  assert.deepEqual(monitoring.cacheEntry("local", "desired").value, { value: "upstream" });
+  assert.deepEqual(await monitoring.read("local", "desired"), { value: "upstream" });
+  assert.equal(fetches, 0, "a fresh upstream cache entry postpones local fallback fetch");
+  service.stop();
+});
+
+test("capable fallback polls only with demand, recovers transient failure, and incapable mode never calls a provider", async () => {
+  let attempts = 0;
+  const provider = { fetch: async () => {
+    attempts += 1;
+    if (attempts === 1) throw new Error("temporary local failure");
+    return { recovered: true };
+  } };
+  const daemon = createButchrd({
+    local: {
+      capabilities: true,
+      providers: { local: provider },
+      freshness: { upstream: [5, 5], pull: [1, 1] },
+      morbrMaximumTtlMs: 5,
+      pollIntervalMs: 6,
+    },
+  });
+  const service = await daemon.start({ watches: [{ provider: "local", resource: "desired" }] });
+  await eventually(() => assert.ok(attempts >= 2));
+  service.stop();
+  const attemptsAfterStop = attempts;
+  await delay(20);
+  assert.equal(attempts, attemptsAfterStop, "shutdown clears lifecycle-owned polling");
+
+  let forbiddenCalls = 0;
+  const incapable = createButchrd({ local: { providers: { local: { fetch: async () => { forbiddenCalls += 1; } } } } });
+  await assert.rejects(incapable.start({ watches: [{ provider: "local", resource: "desired" }] }), /independently configured local capabilities/);
+  assert.equal(forbiddenCalls, 0);
+});
+
+test("resource freshness uses the actual configured upstream cache TTL, including without a declaration", async () => {
+  let clock = 0; let fetches = 0;
+  const provider = { fetch: async () => { fetches += 1; return { local: true }; } };
+  const envelope = { contractVersion: "1.0", kind: "snapshot", subscriptionId: "resource", streamEpoch: 1, sequence: 1, cursor: "freshness", subject: { kind: "resource", key: "opaque" }, data: { ok: true }, meta: { upstreamFreshness: { minimumMs: 4, maximumMs: 6, demandPollIntervalMs: 1 } } };
+  const tooShortFreshness = { pull: [10, 10], upstream: [101, 101], push: [20, 20] };
+  const rejectedEnvelope = { ...envelope, meta: { upstreamFreshness: { minimumMs: 4, maximumMs: 100, demandPollIntervalMs: 1 } } };
+  const rejectingTransport = { subscribe: async ({ onEnvelope }) => { onEnvelope(rejectedEnvelope); return { close() {} }; } };
+  const rejected = createButchrd({ local: { capabilities: true, providers: { local: provider }, transport: rejectingTransport, freshness: tooShortFreshness } });
+  await assert.rejects(rejected.start({ mode: "connected", connectedSubscriptions: [{ id: "resource", subject: { kind: "resource", key: "opaque" }, watchMode: "resource", provider: "local", resource: "desired" }] }), /strictly greater/);
+
+  const freshness = { pull: [101, 101], upstream: [101, 101], push: [20, 20] };
+  const monitoring = createMorbin({ providers: { local: provider }, now: () => clock, freshness, random: () => 0 });
+  const accepted = createButchrd({ morbin: monitoring, local: { capabilities: true, providers: { local: provider }, transport: { subscribe: async ({ onEnvelope }) => { onEnvelope(rejectedEnvelope); return { close() {} }; } }, freshness } });
+  const service = await accepted.start({ mode: "connected", watches: [{ provider: "local", resource: "desired" }], connectedSubscriptions: [{ id: "resource", subject: { kind: "resource", key: "opaque" }, watchMode: "resource", provider: "local", resource: "desired" }] });
+  clock = 21;
+  assert.deepEqual(await accepted.monitoring.read("local", "desired"), { ok: true });
+  assert.equal(fetches, 0, "the real upstream cache entry has not expired at the old 20ms value");
+  clock = 102;
+  assert.deepEqual(await accepted.monitoring.read("local", "desired"), { local: true });
+  assert.equal(fetches, 1);
+  // The active demand has now legitimately fallen back to a pull source.
+  // Its 101ms TTL postpones another poll, then permits the next refresh.
+  clock = 202;
+  await accepted.monitoring.poll();
+  assert.equal(fetches, 1, "first fallback pull postpones the next active poll");
+  clock = 204;
+  await accepted.monitoring.poll();
+  assert.equal(fetches, 2, "a later stale fallback refreshes once");
+  clock = 304;
+  await accepted.monitoring.poll();
+  assert.equal(fetches, 2, "second fallback pull also postpones its successor");
+  clock = 306;
+  await accepted.monitoring.poll();
+  assert.equal(fetches, 3, "two successive stale fallback refreshes are covered");
+  service.stop();
+});
+
+test("terminal revocation hides only connected-origin cache entries and cannot start a late fallback timer", async () => {
+  let calls = 0;
+  const provider = { fetch: async () => { calls += 1; return { local: true }; } };
+  const monitoring = createMorbin({ providers: { local: provider }, freshness: { upstream: [5, 5], pull: [1, 1] } });
+  await monitoring.receive({ provider: "local", resource: "unrelated", value: { local: "kept" } });
+  const transport = { subscribe: async ({ onEnvelope }) => {
+    onEnvelope({ contractVersion: "1.0", kind: "snapshot", subscriptionId: "protected", streamEpoch: 1, sequence: 1, cursor: "upstream", subject: { kind: "resource", key: "opaque" }, data: { protected: true } });
+    onEnvelope({ contractVersion: "1.0", kind: "error", error: { code: "FORBIDDEN" } });
+    return { close() {} };
+  } };
+  const daemon = createButchrd({ morbin: monitoring, local: {
+    capabilities: true, providers: { local: provider }, transport,
+    freshness: { upstream: [5, 5], pull: [1, 1] }, morbrMaximumTtlMs: 5, pollIntervalMs: 6,
+  } });
+  await daemon.start({ mode: "connected", watches: [{ provider: "local", resource: "fallback" }], connectedSubscriptions: [
+    { id: "protected", subject: { kind: "resource", key: "opaque" }, watchMode: "resource", provider: "local", resource: "protected" },
+  ] });
+  assert.equal(daemon.monitoring.cacheEntry("local", "protected"), undefined);
+  await assert.rejects(daemon.monitoring.read("local", "protected"), /FORBIDDEN/);
+  assert.throws(() => daemon.monitoring.watchResource("local", "protected", () => {}), /FORBIDDEN/);
+  assert.deepEqual(daemon.monitoring.cacheEntry("local", "unrelated").value, { local: "kept" });
+  await delay(20);
+  assert.equal(calls, 0, "synchronous revocation leaves no fallback watch or interval alive");
+});
+
+test("terminal authorization during synchronous connected subscribe closes the late handle", async () => {
+  let closed = 0;
+  const transport = { subscribe: ({ onEnvelope }) => {
+    assert.deepEqual(onEnvelope({ contractVersion: "1.0", code: "FORBIDDEN" }), { accepted: false, terminal: true });
+    return { close: () => { closed += 1; } };
+  } };
+  const daemon = createButchrd({ local: { transport } });
+  const service = await daemon.start({ mode: "connected" });
+  assert.equal(closed, 1);
+  assert.equal(daemon.connected, false);
+  service.stop(); assert.equal(closed, 1, "terminal shutdown is idempotent");
+});
+
+test("reconciliation avoids duplicate in-flight work and does not dispatch queued work after stop", async () => {
+  let release; const calls = [];
+  const gate = new Promise(resolve => { release = resolve; });
+  const daemon = createButchrd({ workers: {
+    execute: async work => { calls.push(`run:${work.id}`); await gate; },
+    stop: async id => calls.push(`stop:${id}`),
+  } });
+  const service = await daemon.start();
+  const first = daemon.reconcile({ desired: [{ id: "a" }, { id: "b" }] });
+  await new Promise(resolve => setImmediate(resolve));
+  const duplicate = daemon.reconcile({ desired: [{ id: "a" }] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, ["run:a"]);
+  service.stop(); release();
+  await Promise.all([first, duplicate]);
+  assert.deepEqual(calls, ["run:a", "stop:a"]);
+});
+
+const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+async function eventually(assertion, timeout = 2_000) {
+  const deadline = Date.now() + timeout;
+  let lastError;
+  while (Date.now() < deadline) {
+    try { return assertion(); } catch (error) { lastError = error; await delay(20); }
+  }
+  throw lastError;
+}
+
+function startCli(args) {
+  const child = spawn(process.execPath, ["src/cli.js", ...args], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = ""; let stderr = "";
+  child.stdout.on("data", chunk => { stdout += chunk; });
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  return { child, stdout: () => stdout, stderr: () => stderr };
+}
+
+function waitForExit(child, timeout = 2_000) {
+  return Promise.race([
+    new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal }))),
+    delay(timeout).then(() => { throw new Error("CLI did not exit within bounded interval"); }),
+  ]);
+}
+
+test("CLI keeps a configured fake Morbin transport alive and SIGTERM closes it", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "butchrd-cli-"));
+  const state = join(dir, "state.json"); const eventFile = join(dir, "event.json");
+  const activityFile = join(dir, "activity.jsonl"); const workLog = join(dir, "work.jsonl"); const configPath = join(dir, "config.json");
+  const desired = [{ id: "fake-a" }, { id: "fake-b" }];
+  writeFileSync(eventFile, JSON.stringify({ resource: "desired", value: { desired }, cursor: "initial" }));
+  writeFileSync(configPath, JSON.stringify({
+    fakeProvider: { resources: { desired: { desired } }, eventFile },
+    watches: [{ provider: "fake", resource: "desired" }], activityFile,
+    fakeWorker: { logFile: workLog, delayMs: 300 },
+  }));
+  const first = startCli(["--state", state, "--config", configPath]);
+  t.after(() => { if (first.child.exitCode === null) first.child.kill("SIGKILL"); });
+  await eventually(() => assert.match(first.stdout(), /deploymentId/));
+  assert.equal(first.child.exitCode, null, "the configured provider transport keeps the CLI alive");
+  await eventually(() => assert.match(readFileSync(activityFile, "utf8"), /envelope-received/));
+  await eventually(() => assert.match(readFileSync(workLog, "utf8"), /"execute","id":"fake-a"/));
+  writeFileSync(eventFile, JSON.stringify({ resource: "desired", value: { desired }, cursor: "process-change", source: "push" }));
+  await eventually(() => assert.ok((readFileSync(activityFile, "utf8").match(/envelope-received/g) ?? []).length >= 2));
+  first.child.kill("SIGTERM");
+  assert.deepEqual(await waitForExit(first.child), { code: 0, signal: null });
+  assert.equal(first.stderr(), "");
+  const work = readFileSync(workLog, "utf8");
+  assert.equal((work.match(/"execute","id":"fake-a"/g) ?? []).length, 1, "a repeated desired event cannot duplicate pending work");
+  assert.match(work, /"stop","id":"fake-a"/);
+  assert.doesNotMatch(work, /fake-b/, "queued work must not begin after SIGTERM");
+  const firstIdentity = JSON.parse(first.stdout().trim());
+  const second = startCli(["--state", state, "--config", configPath]);
+  t.after(() => { if (second.child.exitCode === null) second.child.kill("SIGKILL"); });
+  await eventually(() => assert.match(second.stdout(), /deploymentId/));
+  second.child.kill("SIGTERM");
+  assert.deepEqual(await waitForExit(second.child), { code: 0, signal: null });
+  const secondIdentity = JSON.parse(second.stdout().trim());
+  assert.equal(firstIdentity.deploymentId, secondIdentity.deploymentId);
+  assert.notEqual(firstIdentity.instanceId, secondIdentity.instanceId);
+  assert.equal(second.stderr(), "");
+  rmSync(dir, { recursive: true });
+});
+
+test("CLI consumes configured connected config snapshots and changes", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "butchrd-connected-"));
+  const state = join(dir, "state.json"); const eventFile = join(dir, "transport.json");
+  const activityFile = join(dir, "activity.jsonl"); const configPath = join(dir, "config.json");
+  const configEnvelope = (kind, sequence, version) => ({ contractVersion: "1.0", kind, subscriptionId: "config-sub", streamEpoch: 1, sequence, cursor: `config-${version}`, subject: { kind: "config", key: "daemon" }, data: { version, value: { pollMs: version * 1000 } } });
+  const resourceEnvelope = { contractVersion: "1.0", kind: "snapshot", subscriptionId: "resource-sub", streamEpoch: 1, sequence: 1, cursor: "resource-1", subject: { kind: "resource", key: "desired" }, data: { desired: [] } };
+  writeFileSync(eventFile, JSON.stringify({ envelopes: [configEnvelope("snapshot", 1, 1), resourceEnvelope] }));
+  writeFileSync(configPath, JSON.stringify({
+    mode: "connected", fakeTransport: { eventFile }, activityFile,
+    connectedSubscriptions: [
+      { id: "config-sub", subject: { kind: "config", key: "daemon" }, watchMode: "resource" },
+      { id: "resource-sub", subject: { kind: "resource", key: "desired" }, watchMode: "resource" },
+    ],
+  }));
+  const cli = startCli(["--state", state, "--config", configPath]);
+  t.after(() => { if (cli.child.exitCode === null) cli.child.kill("SIGKILL"); });
+  await eventually(() => assert.match(cli.stdout(), /deploymentId/));
+  await eventually(() => assert.equal((readFileSync(activityFile, "utf8").match(/envelope-received/g) ?? []).length, 2));
+  writeFileSync(eventFile, JSON.stringify({ envelopes: [configEnvelope("change", 2, 2)] }));
+  await eventually(() => assert.equal((readFileSync(activityFile, "utf8").match(/envelope-received/g) ?? []).length, 3));
+  cli.child.kill("SIGTERM");
+  assert.deepEqual(await waitForExit(cli.child), { code: 0, signal: null });
+  assert.equal(cli.stderr(), "");
+  rmSync(dir, { recursive: true });
+});
+
+test("CLI terminal revocation stops protected work, closes transport, and exits", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "butchrd-revoked-"));
+  const state = join(dir, "state.json"); const eventFile = join(dir, "transport.json");
+  const activityFile = join(dir, "activity.jsonl"); const workLog = join(dir, "work.jsonl"); const configPath = join(dir, "config.json");
+  const desired = [{ id: "fake-a" }, { id: "fake-b" }];
+  const resourceSnapshot = { contractVersion: "1.0", kind: "snapshot", subscriptionId: "resource-sub", streamEpoch: 1, sequence: 1, cursor: "resource-1", subject: { kind: "resource", key: "desired" }, data: { desired } };
+  writeFileSync(eventFile, JSON.stringify({ envelopes: [resourceSnapshot] }));
+  writeFileSync(configPath, JSON.stringify({
+    mode: "connected", fakeTransport: { eventFile }, activityFile,
+    fakeWorker: { logFile: workLog, delayMs: 300 },
+    connectedSubscriptions: [{ id: "resource-sub", subject: { kind: "resource", key: "desired" }, watchMode: "resource" }],
+  }));
+  const cli = startCli(["--state", state, "--config", configPath]);
+  t.after(() => { if (cli.child.exitCode === null) cli.child.kill("SIGKILL"); });
+  await eventually(() => assert.match(cli.stdout(), /deploymentId/));
+  await eventually(() => assert.match(readFileSync(workLog, "utf8"), /"execute","id":"fake-a"/));
+  writeFileSync(eventFile, JSON.stringify({ contractVersion: "1.0", code: "FORBIDDEN" }));
+  assert.deepEqual(await waitForExit(cli.child), { code: 0, signal: null });
+  assert.equal(cli.stderr(), "");
+  const activity = readFileSync(activityFile, "utf8"); const work = readFileSync(workLog, "utf8");
+  assert.match(activity, /connection-terminal/);
+  assert.match(work, /"stop","id":"fake-a"/);
+  assert.doesNotMatch(work, /fake-b/);
+  rmSync(dir, { recursive: true });
 });
